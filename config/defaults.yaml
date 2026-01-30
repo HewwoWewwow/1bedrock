@@ -1,0 +1,89 @@
+# Austin TIF Model - Default Configuration
+
+# Project Timing
+timing:
+  predevelopment_months: 18
+  construction_months: 24
+  leaseup_months: 12
+  operations_months: 12
+
+# Land & Construction
+construction:
+  land_cost_per_acre: 1000000
+  hard_cost_per_unit: 155000
+  soft_cost_pct: 0.30
+  construction_type: "podium_midrise_5over1"
+
+# Unit Mix (allocations should sum to 1.0)
+unit_mix:
+  studio:
+    gsf: 600
+    allocation: 0.12
+  1br:
+    gsf: 750
+    allocation: 0.25
+  2br:
+    gsf: 900
+    allocation: 0.45
+  3br:
+    gsf: 1150
+    allocation: 0.15
+  4br:
+    gsf: 1450
+    allocation: 0.03
+
+# Rents
+rents:
+  market_rent_psf: 2.50
+
+# Operating Assumptions
+operating:
+  vacancy_rate: 0.06
+  leaseup_pace: 0.08
+  max_occupancy: 0.94
+  opex_utilities: 1200
+  opex_management_pct: 0.05
+  opex_maintenance: 1500
+  opex_misc: 650
+  reserves_pct: 0.02
+
+# Growth Rates (Annual)
+growth_rates:
+  market_rent: 0.02
+  affordable_rent: 0.01
+  opex: 0.03
+  property_tax: 0.02
+
+# Financing - Construction
+financing_construction:
+  rate: 0.075
+  ltc: 0.65
+
+# Financing - Permanent
+financing_permanent:
+  rate: 0.06
+  amort_years: 20
+  ltv_max: 0.65
+  dscr_min: 1.25
+
+# Property Taxes (per $100 of assessed value)
+tax_rates:
+  city: 0.574
+  county: 0.3758
+  isd: 0.9252
+  hospital: 0.098
+  acc: 0.1034
+
+# Exit Assumptions
+exit:
+  cap_rate: 0.055
+  selling_costs_pct: 0.02
+
+# IDC Calculation
+idc:
+  tolerance: 100.0
+  max_iterations: 50
+
+# Hurdle Rate
+hurdle:
+  minimum_irr_improvement_bps: 150
