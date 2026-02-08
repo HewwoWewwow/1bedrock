@@ -87,7 +87,9 @@ def generate_combinations(
             continue
 
         # Tax abatement and TIF are mutually exclusive
-        # (but we still yield these; IncentiveToggles will enforce precedence)
+        # Skip combinations where both are enabled
+        if abate and (tif_lump or tif_stream):
+            continue
 
         # Skip "no incentives" combination (need at least one)
         if not any([fee, abate, tif_lump, tif_stream, buydown]):
@@ -99,7 +101,7 @@ def generate_combinations(
         parts = [f"T{tier.value}"]
         if fee:
             parts.append("Fee")
-        if abate and not (tif_lump or tif_stream):  # Abatement ignored if TIF
+        if abate:
             parts.append("Abate")
         if tif_lump:
             parts.append("TIF-L")

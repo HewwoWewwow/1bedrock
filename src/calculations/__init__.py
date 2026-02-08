@@ -10,6 +10,42 @@ from .tif import calculate_tif_value, TIFResult
 from .dcf import run_dcf, DCFResult, MonthlyCashFlow
 from .metrics import calculate_metrics, ScenarioMetrics, compare_scenarios, ScenarioComparison
 
+# Detailed cashflow module
+from .detailed_cashflow import (
+    AssessedValueBasis,
+    generate_detailed_cash_flow,
+    DetailedCashFlowResult,
+)
+
+# Monte Carlo simulation module
+from .monte_carlo import (
+    DistributionType,
+    InputDistribution,
+    BaseInputs,
+    MonteCarloConfig,
+    IterationResult,
+    SensitivityResult,
+    MonteCarloResult,
+    run_monte_carlo,
+    create_cost_uncertainty_distributions,
+    create_market_uncertainty_distributions,
+    create_financing_uncertainty_distributions,
+    create_timing_uncertainty_distributions,
+    create_full_uncertainty_suite,
+    # TIF Grid Search
+    TIFGridPoint,
+    TIFGridSearchResult,
+    run_tif_grid_search,
+    create_tif_distributions,
+)
+
+# TIF Calculator
+from .tif_calculator import (
+    TIFCalculationResult,
+    calculate_tif_lump_sum_from_tier,
+    get_tier_tif_defaults,
+)
+
 # Property tax module with detailed taxing authority breakdown
 from .property_tax import (
     TaxingAuthority,
@@ -82,4 +118,31 @@ __all__ = [
     "calculate_smart_fee_waiver",
     "CityTaxAbatement",
     "calculate_city_tax_abatement",
+    # Detailed cashflow
+    "AssessedValueBasis",
+    "generate_detailed_cash_flow",
+    "DetailedCashFlowResult",
+    # Monte Carlo simulation
+    "DistributionType",
+    "InputDistribution",
+    "BaseInputs",
+    "MonteCarloConfig",
+    "IterationResult",
+    "SensitivityResult",
+    "MonteCarloResult",
+    "run_monte_carlo",
+    "create_cost_uncertainty_distributions",
+    "create_market_uncertainty_distributions",
+    "create_financing_uncertainty_distributions",
+    "create_timing_uncertainty_distributions",
+    "create_full_uncertainty_suite",
+    # TIF Grid Search
+    "TIFGridPoint",
+    "TIFGridSearchResult",
+    "run_tif_grid_search",
+    "create_tif_distributions",
+    # TIF Calculator
+    "TIFCalculationResult",
+    "calculate_tif_lump_sum_from_tier",
+    "get_tier_tif_defaults",
 ]

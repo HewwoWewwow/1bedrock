@@ -19,7 +19,9 @@ class Phase(str, Enum):
 class PeriodDraw:
     """Single period in the draw schedule.
 
-    Tracks TDC draws, equity, and debt for one month.
+    Tracks TDC draws, equity, TIF, and debt for one month.
+
+    Draw waterfall: Equity FIRST → TIF SECOND → Debt THIRD
     """
     # Period info
     period: int  # 1-indexed period number
@@ -34,13 +36,13 @@ class PeriodDraw:
     tdc_draw_total: float  # Total $ drawn this period
     tdc_eop: float  # TDC remaining at end of period
 
-    # Equity tracking
+    # Equity tracking (drawn FIRST)
     equity_total: float  # Total equity commitment (static)
     equity_bop: float  # Equity remaining at beginning of period
     equity_draw: float  # Equity drawn this period (negative = outflow)
     equity_eop: float  # Equity remaining at end of period
 
-    # Construction debt tracking
+    # Construction debt tracking (drawn THIRD, after equity and TIF exhausted)
     const_debt_total: float  # Total construction loan commitment
     const_debt_bop: float  # Loan balance at beginning of period
     const_debt_draw: float  # Loan drawn this period
@@ -51,12 +53,20 @@ class PeriodDraw:
     is_equity_phase: bool  # True if equity is still being drawn
     is_debt_phase: bool  # True if debt is being drawn
 
+    # TIF tracking (drawn SECOND, after equity exhausted) - optional, defaults to 0
+    tif_total: float = 0.0  # Total TIF lump sum (static)
+    tif_bop: float = 0.0  # TIF remaining at beginning of period
+    tif_draw: float = 0.0  # TIF drawn this period
+    tif_eop: float = 0.0  # TIF remaining at end of period
+    is_tif_phase: bool = False  # True if TIF is being drawn
+
 
 @dataclass
 class DrawSchedule:
     """Complete draw schedule for development.
 
     Contains period-by-period draws for the entire development timeline.
+    Draw waterfall: Equity FIRST → TIF SECOND → Debt THIRD
     """
     periods: List[PeriodDraw]
     total_periods: int
@@ -64,12 +74,13 @@ class DrawSchedule:
     # Summary totals
     total_tdc: float
     total_equity: float
-    total_construction_debt: float
-    total_idc_actual: float  # Actual IDC from period-by-period calc
+    total_tif: float = 0.0  # Total TIF lump sum
+    total_construction_debt: float = 0.0
+    total_idc_actual: float = 0.0  # Actual IDC from period-by-period calc
 
     # Phase boundaries
-    predevelopment_end: int  # Last period of predevelopment
-    construction_end: int  # Last period of construction
+    predevelopment_end: int = 0  # Last period of predevelopment
+    construction_end: int = 0  # Last period of construction
 
     def get_period(self, period: int) -> PeriodDraw:
         """Get draw info for a specific period (1-indexed)."""
@@ -145,24 +156,31 @@ def generate_draw_schedule(
     predevelopment_months: int,
     construction_months: int,
     construction_rate: float,
+    tif_lump_sum: float = 0.0,
     predev_curve: Literal["flat", "s_curve"] = "s_curve",
     construction_curve: Literal["flat", "s_curve"] = "s_curve",
 ) -> DrawSchedule:
     """Generate complete draw schedule for development.
 
-    Key logic:
+    Key logic - Draw Waterfall:
     1. Equity draws FIRST until exhausted
-    2. Then construction loan draws begin
-    3. IDC capitalizes each period based on loan balance
-    4. S-curves applied to predevelopment and construction draws
+    2. TIF draws SECOND (if available) until exhausted
+    3. Construction loan draws THIRD until exhausted
+    4. IDC capitalizes each period based on loan balance
+    5. S-curves applied to predevelopment and construction draws
+
+    The capital stack must equal 100% of TDC:
+    - Debt = ~65% of TDC (bank's LTC cap)
+    - Equity + TIF = ~35% of TDC
 
     Args:
         tdc: Total development cost
-        equity: Total equity commitment
+        equity: Total equity commitment (after TIF reduction)
         construction_loan: Total construction loan commitment
         predevelopment_months: Number of months of predevelopment
         construction_months: Number of months of construction
         construction_rate: Annual interest rate on construction loan
+        tif_lump_sum: TIF lump sum amount (drawn after equity, before debt)
         predev_curve: Draw curve type for predevelopment
         construction_curve: Draw curve type for construction
 
@@ -199,6 +217,7 @@ def generate_draw_schedule(
     # Track running balances
     tdc_remaining = tdc
     equity_remaining = equity
+    tif_remaining = tif_lump_sum
     const_debt_balance = 0.0
     total_idc = 0.0
 
@@ -215,16 +234,34 @@ def generate_draw_schedule(
         tdc_remaining -= draw_amount
         tdc_eop = tdc_remaining
 
-        # Equity draws first (all predevelopment is typically equity)
+        # Waterfall: Equity FIRST, then TIF, then Debt
         equity_bop = equity_remaining
-        equity_draw = -min(draw_amount, equity_remaining)  # Negative = outflow
-        equity_remaining = max(0, equity_remaining - draw_amount)
-        equity_eop = equity_remaining
+        tif_bop = tif_remaining
+        remaining_to_fund = draw_amount
 
-        # No construction debt during predevelopment
+        # 1. Equity first
+        equity_portion = min(remaining_to_fund, equity_remaining)
+        equity_draw = -equity_portion  # Negative = outflow
+        equity_remaining -= equity_portion
+        remaining_to_fund -= equity_portion
+
+        # 2. TIF second (if equity exhausted)
+        tif_portion = min(remaining_to_fund, tif_remaining)
+        tif_draw = tif_portion
+        tif_remaining -= tif_portion
+        remaining_to_fund -= tif_portion
+
+        # 3. Debt third (shouldn't happen in predevelopment typically)
+        debt_portion = remaining_to_fund  # Whatever is left
+
+        equity_eop = equity_remaining
+        tif_eop = tif_remaining
+
+        # No construction debt during predevelopment (typically)
         const_debt_bop = const_debt_balance
-        const_debt_draw = 0.0
-        const_debt_interest = 0.0
+        const_debt_draw = debt_portion
+        const_debt_interest = 0.0 if debt_portion == 0 else const_debt_balance * monthly_rate
+        const_debt_balance += const_debt_draw + const_debt_interest
         const_debt_eop = const_debt_balance
 
         periods.append(PeriodDraw(
@@ -241,13 +278,18 @@ def generate_draw_schedule(
             equity_bop=equity_bop,
             equity_draw=equity_draw,
             equity_eop=equity_eop,
+            tif_total=tif_lump_sum,
+            tif_bop=tif_bop,
+            tif_draw=tif_draw,
+            tif_eop=tif_eop,
             const_debt_total=construction_loan,
             const_debt_bop=const_debt_bop,
             const_debt_draw=const_debt_draw,
             const_debt_interest=const_debt_interest,
             const_debt_eop=const_debt_eop,
             is_equity_phase=equity_remaining > 0,
-            is_debt_phase=False,
+            is_tif_phase=tif_remaining > 0 and equity_remaining == 0,
+            is_debt_phase=const_debt_draw > 0,
         ))
 
     # Construction periods
@@ -261,22 +303,29 @@ def generate_draw_schedule(
         tdc_remaining -= draw_amount
         tdc_eop = tdc_remaining
 
-        # Determine equity vs debt funding
+        # Waterfall: Equity FIRST, then TIF, then Debt
         equity_bop = equity_remaining
+        tif_bop = tif_remaining
         const_debt_bop = const_debt_balance
+        remaining_to_fund = draw_amount
 
-        if equity_remaining > 0:
-            # Still have equity to draw
-            equity_portion = min(draw_amount, equity_remaining)
-            debt_portion = draw_amount - equity_portion
-        else:
-            # Equity exhausted, all debt
-            equity_portion = 0.0
-            debt_portion = draw_amount
-
+        # 1. Equity first
+        equity_portion = min(remaining_to_fund, equity_remaining)
         equity_draw = -equity_portion  # Negative = outflow
-        equity_remaining = max(0, equity_remaining - equity_portion)
+        equity_remaining -= equity_portion
+        remaining_to_fund -= equity_portion
+
+        # 2. TIF second (if equity exhausted)
+        tif_portion = min(remaining_to_fund, tif_remaining)
+        tif_draw = tif_portion
+        tif_remaining -= tif_portion
+        remaining_to_fund -= tif_portion
+
+        # 3. Debt third (whatever is left)
+        debt_portion = remaining_to_fund
+
         equity_eop = equity_remaining
+        tif_eop = tif_remaining
 
         # Construction debt draw
         const_debt_draw = debt_portion
@@ -304,12 +353,17 @@ def generate_draw_schedule(
             equity_bop=equity_bop,
             equity_draw=equity_draw,
             equity_eop=equity_eop,
+            tif_total=tif_lump_sum,
+            tif_bop=tif_bop,
+            tif_draw=tif_draw,
+            tif_eop=tif_eop,
             const_debt_total=construction_loan,
             const_debt_bop=const_debt_bop,
             const_debt_draw=const_debt_draw,
             const_debt_interest=const_debt_interest,
             const_debt_eop=const_debt_eop,
             is_equity_phase=equity_remaining > 0,
+            is_tif_phase=tif_remaining > 0 and equity_remaining == 0,
             is_debt_phase=const_debt_draw > 0,
         ))
 
@@ -318,6 +372,7 @@ def generate_draw_schedule(
         total_periods=total_periods,
         total_tdc=tdc,
         total_equity=equity,
+        total_tif=tif_lump_sum,
         total_construction_debt=construction_loan,
         total_idc_actual=total_idc,
         predevelopment_end=predevelopment_months,

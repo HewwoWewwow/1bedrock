@@ -161,7 +161,7 @@ class SharedInputs:
     market_rent_growth: float = 0.02
     affordable_rent_growth: float = 0.01
     opex_growth: float = 0.03
-    property_tax_growth: float = 0.02
+    property_tax_growth: float = 0.01
 
     # Financing - Construction
     construction_rate: float = 0.075
