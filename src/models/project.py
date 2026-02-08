@@ -89,19 +89,20 @@ class ProjectInputs:
     # === Land & Construction ===
     land_cost_per_acre: float = 1_000_000.0
     target_units: int = 200
-    hard_cost_per_unit: float = 155_000.0
-    soft_cost_pct: float = 0.30  # As percentage of hard costs
+    hard_cost_per_unit: float = 175_000  # Excel default.0
+    soft_cost_pct: float = 0.44  # As % of hard costs (includes predevelopment + IDC buffer)
     construction_type: ConstructionType = ConstructionType.PODIUM_5OVER1
 
     # === Unit Mix ===
     # Default values from Austin TIF Model spreadsheet v10c
-    # NSF assumes 0.85 efficiency; market rents are explicit monthly amounts
+    # NSF assumes 0.85 efficiency; rents calculated as rent_psf × nsf
+    # Rent PSF pattern: $3.50 (studio/1br), $3.40 (2br), $3.30 (3br), $3.20 (4br)
     unit_mix: Dict[str, UnitMixEntry] = field(default_factory=lambda: {
-        "studio": UnitMixEntry("studio", gsf=600, allocation=0.12, nsf=510, market_rent_monthly=2100),
-        "1br": UnitMixEntry("1br", gsf=750, allocation=0.25, nsf=638, market_rent_monthly=2625),
-        "2br": UnitMixEntry("2br", gsf=900, allocation=0.45, nsf=765, market_rent_monthly=3060),
-        "3br": UnitMixEntry("3br", gsf=1150, allocation=0.15, nsf=978, market_rent_monthly=3795),
-        "4br": UnitMixEntry("4br", gsf=1450, allocation=0.03, nsf=1233, market_rent_monthly=4640),
+        "studio": UnitMixEntry("studio", gsf=600, allocation=0.12, nsf=510, rent_psf=3.50),
+        "1br": UnitMixEntry("1br", gsf=750, allocation=0.25, nsf=638, rent_psf=3.50),
+        "2br": UnitMixEntry("2br", gsf=900, allocation=0.45, nsf=765, rent_psf=3.40),
+        "3br": UnitMixEntry("3br", gsf=1150, allocation=0.15, nsf=978, rent_psf=3.30),
+        "4br": UnitMixEntry("4br", gsf=1450, allocation=0.03, nsf=1233, rent_psf=3.20),
     })
 
     # === Rents ===
@@ -123,7 +124,7 @@ class ProjectInputs:
     market_rent_growth: float = 0.02
     affordable_rent_growth: float = 0.01
     opex_growth: float = 0.03
-    property_tax_growth: float = 0.02
+    property_tax_growth: float = 0.01
 
     # === Financing ===
     # Construction Loan
@@ -259,6 +260,25 @@ class ProjectInputs:
         if not 0.99 <= allocation_sum <= 1.01:
             errors.append(f"unit_mix allocations must sum to 1.0, got {allocation_sum:.2f}")
 
+        # Affordable unit sanity check
+        affordable_count = self.get_affordable_unit_count()
+        market_count = self.get_market_unit_count()
+        if affordable_count > self.target_units:
+            errors.append(
+                f"affordable units ({affordable_count}) exceed target_units ({self.target_units})"
+            )
+        if market_count < 0:
+            errors.append(
+                f"market units ({market_count}) is negative — affordable_pct too high"
+            )
+
+        # Weighted average GSF sanity check
+        avg_gsf = self.get_weighted_avg_gsf()
+        if avg_gsf < 200:
+            errors.append(f"weighted avg GSF is implausibly low ({avg_gsf:.0f} SF)")
+        elif avg_gsf > 3000:
+            errors.append(f"weighted avg GSF is implausibly high ({avg_gsf:.0f} SF)")
+
         # Incentive validation
         if self.incentive_config is not None:
             toggles = self.incentive_config.toggles
@@ -289,7 +309,8 @@ class ProjectInputs:
             construction_type=self.construction_type,
             unit_mix={k: UnitMixEntry(
                           v.unit_type, v.gsf, v.allocation,
-                          nsf=v.nsf, market_rent_monthly=v.market_rent_monthly, ami_tier=v.ami_tier)
+                          nsf=v.nsf, rent_psf=v.rent_psf,
+                          market_rent_monthly=v.market_rent_monthly, ami_tier=v.ami_tier)
                       for k, v in self.unit_mix.items()},
             market_rent_psf=self.market_rent_psf,
             vacancy_rate=self.vacancy_rate,

@@ -19,7 +19,14 @@ from dateutil.relativedelta import relativedelta
 from enum import Enum
 import numpy_financial as npf
 
+
+class AssessedValueBasis(str, Enum):
+    """Basis for property tax assessed value calculation."""
+    TDC = "tdc"  # Total Development Cost with escalations
+    NOI = "noi"  # Capitalized NOI (income approach)
+
 from src.calculations.sources_uses import SourcesUses, calculate_sources_uses
+from src.calculations.debt import calculate_interest_portion, calculate_principal_portion
 from src.calculations.draw_schedule import (
     DrawSchedule, PeriodDraw, Phase,
     generate_draw_schedule_from_sources_uses
@@ -363,6 +370,8 @@ def generate_detailed_cash_flow(
     existing_assessed_value: float,
     tax_stack: Optional[TaxingAuthorityStack] = None,
     assessment_growth_rate: float = 0.02,
+    assessed_value_basis: AssessedValueBasis = AssessedValueBasis.TDC,  # TDC or NOI-based
+    assessed_value_override: Optional[float] = None,  # Direct override for assessed value
 
     # Escalation inputs
     market_rent_growth: float = 0.02,
@@ -374,10 +383,18 @@ def generate_detailed_cash_flow(
     perm_amort_years: int = 20,
     perm_ltv_max: float = 0.65,
     perm_dscr_min: float = 1.25,
+    perm_ltc_max: Optional[float] = None,  # If set, cap perm at this % of TDC (loan-to-cost)
 
     # Exit inputs
     exit_cap_rate: float = 0.055,
     reserves_pct: float = 0.005,  # % of EGI
+
+    # IRR calculation options
+    exclude_land_from_irr: bool = True,  # Land is recovered at sale, not a "cost"
+    exclude_idc_from_irr: bool = True,   # IDC is financing cost, not development cost
+
+    # Perm loan sizing options
+    cap_perm_at_construction: bool = True,  # If True, perm loan ≤ construction loan (no cash-out)
 
     # Mixed income inputs (optional)
     affordable_pct: float = 0.0,
@@ -421,6 +438,12 @@ def generate_detailed_cash_flow(
         predevelopment_months=predevelopment_months,
     )
 
+    # TIF lump sum reduces equity requirement (front-loaded incentive)
+    # The TIF is treated as an additional source of funds that offsets equity
+    tif_lump_sum_applied = 0.0
+    if tif_treatment == "lump_sum" and tif_lump_sum > 0:
+        tif_lump_sum_applied = min(tif_lump_sum, sources_uses.equity)  # Can't exceed equity
+
     # Generate draw schedule
     draw_schedule = generate_draw_schedule_from_sources_uses(
         sources_uses=sources_uses,
@@ -436,14 +459,23 @@ def generate_detailed_cash_flow(
     operations_end = leaseup_end + operations_months
     total_periods = operations_end + 1  # +1 for reversion period
 
-    # Calculate stabilized value for property tax assessment
-    annual_noi_stabilized = monthly_gpr_at_stabilization * 12 * (1 - vacancy_rate) * 0.60  # Rough NOI margin
-    stabilized_value = annual_noi_stabilized / exit_cap_rate
+    # Calculate assessed value basis for property tax
+    if assessed_value_override is not None:
+        # Use directly specified assessed value
+        assessment_base = assessed_value_override
+    elif assessed_value_basis == AssessedValueBasis.TDC:
+        # Use Total Development Cost as assessment basis (cost approach)
+        # This is more typical of how assessors value new construction
+        assessment_base = sources_uses.tdc
+    else:
+        # Use capitalized NOI (income approach)
+        annual_noi_rough = monthly_gpr_at_stabilization * 12 * (1 - vacancy_rate) * 0.60  # Rough NOI margin
+        assessment_base = annual_noi_rough / exit_cap_rate
 
     # Calculate assessed values
     assessed_values = calculate_assessed_value_schedule(
         existing_value=existing_assessed_value,
-        stabilized_value=stabilized_value,
+        stabilized_value=assessment_base,
         predevelopment_months=predevelopment_months,
         construction_months=construction_months,
         leaseup_months=leaseup_months,
@@ -453,16 +485,27 @@ def generate_detailed_cash_flow(
     )
 
     # Size permanent loan at stabilization
-    # Stabilized NOI
-    stabilized_gpr = monthly_gpr_at_stabilization * (1 - vacancy_rate)
+    # For loan sizing, always use income approach (what lenders use)
+    # Stabilized NOI calculation - account for mixed-income unit mix
+    market_portion = 1 - affordable_pct
+    affordable_portion = affordable_pct
+    affordable_rent = monthly_gpr_at_stabilization * (1 - affordable_rent_discount)
+
+    # Blended GPR for mixed-income scenario
+    blended_gpr = (monthly_gpr_at_stabilization * market_portion) + (affordable_rent * affordable_portion)
+
+    stabilized_gpr = blended_gpr * (1 - vacancy_rate)
     stabilized_egi = stabilized_gpr
     stabilized_monthly_opex = (annual_opex_per_unit * total_units) / 12
-    stabilized_monthly_taxes = stabilized_value * tax_stack.total_rate_decimal / 12
+    stabilized_monthly_taxes = assessment_base * tax_stack.total_rate_decimal / 12
     stabilized_monthly_noi = stabilized_egi - stabilized_monthly_opex - stabilized_monthly_taxes
     stabilized_annual_noi = stabilized_monthly_noi * 12
 
+    # Property value for LTV (always income approach for lenders)
+    property_value_for_ltv = stabilized_annual_noi / exit_cap_rate
+
     # LTV constraint
-    ltv_loan = stabilized_value * perm_ltv_max
+    ltv_loan = property_value_for_ltv * perm_ltv_max
 
     # DSCR constraint
     annual_debt_service_max = stabilized_annual_noi / perm_dscr_min
@@ -475,8 +518,11 @@ def generate_detailed_cash_flow(
     else:
         dscr_loan = 0
 
-    # Take lesser of LTV and DSCR
-    perm_loan_amount = min(ltv_loan, dscr_loan)
+    # Take lesser of LTV, DSCR, and optionally LTC (loan-to-cost)
+    perm_loan_max = min(ltv_loan, dscr_loan)
+    if perm_ltc_max is not None:
+        ltc_loan = sources_uses.tdc * perm_ltc_max
+        perm_loan_max = min(perm_loan_max, ltc_loan)
 
     # Generate period-by-period cash flows
     periods: List[DetailedPeriodCashFlow] = []
@@ -507,6 +553,7 @@ def generate_detailed_cash_flow(
     total_noi = 0.0
     total_debt_service = 0.0
     reversion_value = 0.0
+    fixed_perm_pmt = 0.0  # Set at perm loan origination, reused for all periods
 
     for period in range(1, total_periods + 1):
         # Determine dates
@@ -629,11 +676,14 @@ def generate_detailed_cash_flow(
         affordable_rent = base_gpr_market * (1 - affordable_rent_discount)
         escalated_affordable = affordable_rent * (1 + affordable_bump)
 
+        # Calculate blended GPR for mixed-income scenario
+        gpr_mixed_total = (escalated_gpr_market * market_portion) + (escalated_affordable * affordable_portion)
+
         gpr = GPRRow(
             gpr_all_market=escalated_gpr_market,
             gpr_mixed_market=escalated_gpr_market * market_portion,
             gpr_mixed_affordable=escalated_affordable * affordable_portion,
-            gpr_total=escalated_gpr_market,  # Use market rate for now
+            gpr_total=gpr_mixed_total,  # Blended GPR based on unit mix
         )
 
         # Operating expenses
@@ -734,8 +784,16 @@ def generate_detailed_cash_flow(
                 cumulative_occupancy = max_occupancy
 
             # Calculate NOI
-            period_gpr = gpr.gpr_total * cumulative_occupancy
-            period_vacancy = period_gpr * vacancy_rate if cumulative_occupancy >= max_occupancy else 0
+            # GPR is always max potential rent (100% occupied)
+            period_gpr = gpr.gpr_total
+
+            # Vacancy represents total economic loss from GPR
+            # - During leaseup: vacancy = 1 - cumulative_occupancy (unleased units)
+            # - At stabilization: vacancy = 1 - max_occupancy (stabilized vacancy rate)
+            # The vacancy_rate input represents the stabilized economic vacancy (e.g., 6%)
+            # max_occupancy = 1 - vacancy_rate at stabilization
+            total_vacancy_pct = 1.0 - cumulative_occupancy
+            period_vacancy = period_gpr * total_vacancy_pct
             period_egi = period_gpr - period_vacancy
 
             # TIF reimbursement adds to NOI
@@ -748,7 +806,7 @@ def generate_detailed_cash_flow(
             operations = OperationsRow(
                 leaseup_pct=cumulative_occupancy,
                 gpr=period_gpr,
-                vacancy_rate=vacancy_rate if cumulative_occupancy >= max_occupancy else 0,
+                vacancy_rate=total_vacancy_pct,  # Includes unleased units + economic vacancy
                 less_vacancy=period_vacancy,
                 egi=period_egi,
                 less_opex_ex_taxes=opex.opex_ex_prop_taxes,
@@ -795,6 +853,8 @@ def generate_detailed_cash_flow(
             )
         elif period == construction_end + 1:
             # Payoff construction loan
+            # Save balance before zeroing - this caps the perm loan (no cash-out refi)
+            const_loan_payoff_amount = const_loan_balance
             const_debt = ConstructionDebtRow(
                 principal_bop=const_loan_balance,
                 debt_added=0,
@@ -815,48 +875,59 @@ def generate_detailed_cash_flow(
             )
 
         # Permanent debt
+        perm_monthly_rate = perm_rate / 12 if perm_rate > 0 else 0.0
         if period == construction_end + 1:
-            # Perm loan funds
+            # Perm loan funds — calculate fixed payment at origination
+            if cap_perm_at_construction:
+                # Cap at construction loan payoff (no cash-out refi)
+                perm_loan_amount = min(perm_loan_max, const_loan_payoff_amount)
+            else:
+                # Allow perm to be sized by LTV/DSCR only (may exceed construction loan)
+                perm_loan_amount = perm_loan_max
             perm_loan_balance = perm_loan_amount
-            pmt, i_pmt, p_pmt = _calculate_monthly_pmt(perm_loan_amount, perm_rate, perm_amort_years)
+            fixed_perm_pmt, _, _ = _calculate_monthly_pmt(perm_loan_amount, perm_rate, perm_amort_years)
+            i_pmt = calculate_interest_portion(perm_loan_balance, perm_monthly_rate)
+            p_pmt = calculate_principal_portion(fixed_perm_pmt, i_pmt)
             perm_debt = PermanentDebtRow(
                 principal_bop=0,
-                pmt_in_period=pmt,
+                pmt_in_period=fixed_perm_pmt,
                 interest_pmt=i_pmt,
                 principal_pmt=p_pmt,
                 payoff=0,
                 principal_eop=perm_loan_amount - p_pmt,
-                net_cf=perm_loan_amount - pmt,  # Inflow from funding - first payment
+                net_cf=perm_loan_amount - fixed_perm_pmt,  # Inflow from funding - first payment
             )
             perm_loan_balance = perm_loan_amount - p_pmt
-            total_debt_service += pmt
+            total_debt_service += fixed_perm_pmt
         elif period > construction_end + 1 and not is_reversion:
-            # Regular perm loan payments
-            pmt, i_pmt, p_pmt = _calculate_monthly_pmt(perm_loan_balance, perm_rate, perm_amort_years)
+            # Regular perm loan payments — use fixed payment from origination
+            i_pmt = calculate_interest_portion(perm_loan_balance, perm_monthly_rate)
+            p_pmt = calculate_principal_portion(fixed_perm_pmt, i_pmt)
             perm_debt = PermanentDebtRow(
                 principal_bop=perm_loan_balance,
-                pmt_in_period=pmt,
+                pmt_in_period=fixed_perm_pmt,
                 interest_pmt=i_pmt,
                 principal_pmt=p_pmt,
                 payoff=0,
                 principal_eop=perm_loan_balance - p_pmt,
-                net_cf=-pmt,  # Outflow for payment
+                net_cf=-fixed_perm_pmt,  # Outflow for payment
             )
             perm_loan_balance -= p_pmt
-            total_debt_service += pmt
+            total_debt_service += fixed_perm_pmt
         elif is_reversion:
-            # Payoff perm loan
-            pmt, i_pmt, p_pmt = _calculate_monthly_pmt(perm_loan_balance, perm_rate, perm_amort_years)
+            # Payoff perm loan — use fixed payment for final period split
+            i_pmt = calculate_interest_portion(perm_loan_balance, perm_monthly_rate)
+            p_pmt = calculate_principal_portion(fixed_perm_pmt, i_pmt)
             perm_debt = PermanentDebtRow(
                 principal_bop=perm_loan_balance,
-                pmt_in_period=pmt,
+                pmt_in_period=fixed_perm_pmt,
                 interest_pmt=i_pmt,
                 principal_pmt=p_pmt,
                 payoff=-perm_loan_balance,
                 principal_eop=0,
-                net_cf=-pmt - perm_loan_balance,  # Payment + payoff
+                net_cf=-fixed_perm_pmt - perm_loan_balance,  # Payment + payoff
             )
-            total_debt_service += pmt
+            total_debt_service += fixed_perm_pmt
             perm_loan_balance = 0
         else:
             perm_debt = PermanentDebtRow(
@@ -981,14 +1052,37 @@ def generate_detailed_cash_flow(
         ))
 
     # Calculate IRRs
+    # Adjust unlevered cash flows based on exclusion settings
+    adjusted_unlevered_cfs = unlevered_cfs.copy()
+
+    if exclude_land_from_irr:
+        # Add back land cost from first predevelopment period
+        # Land is recovered at sale, so it's not a true "cost" in IRR terms
+        adjusted_unlevered_cfs[0] += land_cost
+
+    if exclude_idc_from_irr:
+        # Add back IDC spread over construction periods
+        # IDC is a financing cost, not a development cost
+        idc_per_period = sources_uses.idc / construction_months
+        for i in range(predev_end, construction_end):
+            adjusted_unlevered_cfs[i] += idc_per_period
+
+    # Adjust levered cash flows for TIF lump sum
+    # TIF lump sum is a front-loaded incentive that reduces equity requirement
+    # Add as positive inflow in period 1 to offset equity outflow
+    adjusted_levered_cfs = levered_cfs.copy()
+    if tif_lump_sum_applied > 0:
+        adjusted_levered_cfs[0] += tif_lump_sum_applied
+        total_equity_invested -= tif_lump_sum_applied  # Reduce net equity
+
     try:
-        monthly_unlevered_irr = npf.irr(unlevered_cfs)
+        monthly_unlevered_irr = npf.irr(adjusted_unlevered_cfs)
         unlevered_irr = (1 + monthly_unlevered_irr) ** 12 - 1
     except:
         unlevered_irr = 0.0
 
     try:
-        monthly_levered_irr = npf.irr(levered_cfs)
+        monthly_levered_irr = npf.irr(adjusted_levered_cfs)
         levered_irr = (1 + monthly_levered_irr) ** 12 - 1
     except:
         levered_irr = 0.0

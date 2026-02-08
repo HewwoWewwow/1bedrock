@@ -28,6 +28,7 @@ def allocate_units(
     affordable_pct: float,
     ami_level: str,
     market_rent_psf: float,
+    efficiency: float = 0.0,
 ) -> list[UnitAllocation]:
     """Allocate units by bedroom type for market and affordable pools.
 
@@ -40,6 +41,8 @@ def allocate_units(
         affordable_pct: Percentage of units that are affordable (0-1).
         ami_level: AMI level string (e.g., "50%", "60%") - fallback if unit has no ami_tier.
         market_rent_psf: Monthly rent per NSF for market units - fallback if unit has no rent_psf.
+        efficiency: Net-to-gross efficiency ratio (e.g., 0.85). When > 0, uses
+            UnitMixEntry.get_gsf_from_efficiency() to derive GSF from NSF.
 
     Returns:
         List of UnitAllocation for each unit type.
@@ -66,8 +69,11 @@ def allocate_units(
         # Remaining are market units
         market_of_type = total_of_type - affordable_of_type
 
-        # Get NSF (use entry.nsf if set, otherwise estimate from gsf)
-        nsf = entry.nsf if entry.nsf > 0 else int(entry.gsf * 0.82)
+        # Get GSF (optionally derived from NSF and efficiency)
+        gsf = entry.get_gsf_from_efficiency(efficiency) if efficiency > 0 else entry.gsf
+
+        # Get NSF via the UnitMixEntry method (falls back to gsf * 0.82 if nsf not set)
+        nsf = entry.get_nsf()
 
         # Calculate market rent:
         # 1. Use explicit market_rent_monthly if set
@@ -91,7 +97,7 @@ def allocate_units(
         allocations.append(
             UnitAllocation(
                 unit_type=unit_type,
-                gsf=entry.gsf,
+                gsf=gsf,
                 nsf=nsf,
                 total_units=total_of_type,
                 market_units=market_of_type,

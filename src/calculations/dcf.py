@@ -9,12 +9,13 @@ import numpy_financial as npf
 from ..models.project import ProjectInputs, Scenario, ReversionNOIBasis, TIFStartTiming
 from ..models.incentives import IncentiveConfig, IncentiveToggles, get_tier_config, IncentiveTier
 from .land import calculate_land
-from .units import allocate_units, get_total_units
-from .revenue import calculate_gpr
-from .costs import calculate_tdc, calculate_opex_monthly
-from .taxes import calculate_property_taxes, calculate_assessed_value
+from .units import allocate_units, get_total_units, get_total_affordable_units
+from .revenue import calculate_gpr, calculate_egi, calculate_egi_with_leaseup, escalate_rent
+from .costs import calculate_tdc, calculate_opex_monthly, escalate_opex
+from .taxes import calculate_property_taxes, calculate_assessed_value, escalate_taxes
 from .debt import size_construction_loan, size_permanent_loan, calculate_loan_balance
 from .tif import calculate_tif_value, get_tif_payment_for_month
+from .draw_schedule import generate_draw_schedule, DrawSchedule
 
 
 class Phase(Enum):
@@ -97,6 +98,9 @@ class DCFResult:
     # TIF value (if applicable)
     tif_capitalized_value: float = 0.0
 
+    # Draw schedule (for equity timing)
+    draw_schedule: DrawSchedule | None = None
+
 
 def get_phase(month: int, inputs: ProjectInputs) -> Phase:
     """Determine the phase for a given month.
@@ -118,6 +122,92 @@ def get_phase(month: int, inputs: ProjectInputs) -> Phase:
         return Phase.OPERATIONS
     else:
         return Phase.REVERSION
+
+
+def _calculate_operating_period(
+    cf: MonthlyCashFlow,
+    month: int,
+    gpr_result,
+    inputs: ProjectInputs,
+    total_units: int,
+    tax_result,
+    perm_loan,
+    years_operating: int,
+    tif_result,
+    incentive_config,
+    is_leaseup: bool,
+) -> None:
+    """Populate revenue, opex, and NOI fields for a lease-up or operations month.
+
+    Uses the dedicated escalation, EGI, and opex functions rather than
+    inline calculations, ensuring a single source of truth for each formula.
+
+    Args:
+        cf: MonthlyCashFlow to populate (mutated in place).
+        month: Current month number (1-indexed).
+        gpr_result: GPR calculation result.
+        inputs: Project inputs for rates and assumptions.
+        total_units: Total unit count.
+        tax_result: Property tax result for base taxes.
+        perm_loan: Permanent loan sizing result.
+        years_operating: Years since lease-up start (for escalation).
+        tif_result: TIF result (or None).
+        incentive_config: Incentive config (or None).
+        is_leaseup: True for lease-up phase, False for stabilized operations.
+    """
+    # Revenue with escalation
+    cf.gross_potential_rent = (
+        escalate_rent(gpr_result.market_gpr_monthly, years_operating, inputs.market_rent_growth)
+        + escalate_rent(gpr_result.affordable_gpr_monthly, years_operating, inputs.affordable_rent_growth)
+    )
+
+    # Occupancy and EGI
+    if is_leaseup:
+        month_in_leaseup = month - inputs.leaseup_start_month + 1
+        egi, occupancy = calculate_egi_with_leaseup(
+            cf.gross_potential_rent, month_in_leaseup,
+            inputs.leaseup_months, inputs.leaseup_pace, inputs.max_occupancy,
+        )
+        cf.occupancy_rate = occupancy
+        cf.effective_gross_income = egi
+    else:
+        cf.occupancy_rate = inputs.max_occupancy
+        cf.effective_gross_income = calculate_egi(cf.gross_potential_rent, inputs.vacancy_rate)
+
+    cf.vacancy_loss = cf.gross_potential_rent - cf.effective_gross_income
+
+    # OpEx with escalation
+    escalated_opex_per_unit = escalate_opex(
+        inputs.annual_opex_per_unit, years_operating, inputs.opex_growth,
+    )
+    total_opex, _mgmt_fee, reserves = calculate_opex_monthly(
+        total_units, escalated_opex_per_unit, cf.effective_gross_income,
+        inputs.opex_management_pct, inputs.reserves_pct,
+    )
+    cf.operating_expenses = total_opex - reserves  # Fixed + management
+    cf.reserves = reserves
+
+    # Property taxes with escalation
+    cf.property_taxes = escalate_taxes(
+        tax_result.net_tax_annual / 12, years_operating, inputs.property_tax_growth,
+    )
+
+    # NOI
+    cf.noi = cf.effective_gross_income - cf.operating_expenses - cf.reserves - cf.property_taxes
+
+    # Debt service
+    cf.perm_debt_service = perm_loan.monthly_payment
+
+    # TIF stream payment — escalate from TIF start, not lease-up start
+    if tif_result is not None and incentive_config is not None:
+        if incentive_config.toggles.tif_stream:
+            years_since_tif_start = max(0, (month - tif_result.start_month) // 12)
+            cf.tif_payment = get_tif_payment_for_month(
+                tif_result, month, years_since_tif_start,
+            )
+
+    cf.unlevered_cf = cf.noi
+    cf.levered_cf = cf.noi + cf.tif_payment - cf.perm_debt_service
 
 
 def run_dcf(
@@ -161,7 +251,7 @@ def run_dcf(
         market_rent_psf=inputs.market_rent_psf,
     )
     total_units = get_total_units(allocations)
-    affordable_units = sum(a.affordable_units for a in allocations)
+    affordable_units = get_total_affordable_units(allocations)
 
     # GPR
     gpr_result = calculate_gpr(allocations)
@@ -206,14 +296,11 @@ def run_dcf(
     reserves_annual = stabilized_egi_annual * inputs.reserves_pct
     stabilized_opex_annual = opex_fixed_annual + mgmt_annual + reserves_annual
 
-    # Property taxes (need assessed value from stabilized value)
-    # Circular: need NOI for value, need value for taxes
-    # Use iterative approach or estimate
-    estimated_noi = stabilized_egi_annual - stabilized_opex_annual
-    estimated_value = estimated_noi / inputs.exit_cap_rate
-
+    # Property taxes - use TDC as the assessed value basis
+    # This matches typical tax assessment methodology for new developments
+    # The TDC represents the cost basis which is how properties are initially assessed
     tax_result = calculate_property_taxes(
-        assessed_value=estimated_value,
+        assessed_value=tdc_result.tdc,
         existing_assessed_value=inputs.existing_assessed_value,
         tax_rates=inputs.tax_rates,
     )
@@ -270,10 +357,25 @@ def run_dcf(
 
     # Equity required
     equity = tdc_result.tdc - construction_loan.loan_amount
+    tif_lump_sum_value = 0.0
     if tif_result is not None and incentive_config is not None:
         if incentive_config.toggles.tif_lump_sum:
-            equity -= tif_result.capitalized_value
+            tif_lump_sum_value = tif_result.capitalized_value
+            equity -= tif_lump_sum_value
     result.equity_required = equity
+
+    # Generate draw schedule for proper equity timing
+    # Draw waterfall: Equity FIRST → TIF SECOND → Debt THIRD
+    draw_sched = generate_draw_schedule(
+        tdc=tdc_result.tdc,
+        equity=equity,
+        construction_loan=construction_loan.loan_amount,
+        predevelopment_months=inputs.predevelopment_months,
+        construction_months=inputs.construction_months,
+        construction_rate=inputs.construction_rate,
+        tif_lump_sum=tif_lump_sum_value,
+    )
+    result.draw_schedule = draw_sched
 
     # Yield on cost
     result.yield_on_cost = stabilized_noi_annual / tdc_result.tdc if tdc_result.tdc > 0 else 0
@@ -294,123 +396,57 @@ def run_dcf(
             years_operating = 0
 
         if phase == Phase.PREDEVELOPMENT:
-            # No cash flows during predevelopment in levered analysis
-            # All costs are funded at construction start
+            # Equity is drawn as costs are incurred during predevelopment
+            # Use draw schedule to get the equity draw for this month
+            period_draw = draw_sched.get_period(month)
+            # equity_draw is negative (outflow), store as positive contribution
+            cf.equity_contribution = -period_draw.equity_draw if period_draw.equity_draw < 0 else 0.0
             cf.levered_cf = 0.0
             cf.unlevered_cf = 0.0
 
         elif phase == Phase.CONSTRUCTION:
-            # No operating cash flows during construction
-            # Equity is invested at month 1 of construction (handled in IRR calc)
+            # Equity continues to be drawn as costs are incurred during construction
+            # Once equity is exhausted, TIF and then debt fund remaining costs
+            period_draw = draw_sched.get_period(month)
+            # equity_draw is negative (outflow), store as positive contribution
+            cf.equity_contribution = -period_draw.equity_draw if period_draw.equity_draw < 0 else 0.0
             cf.levered_cf = 0.0
             cf.unlevered_cf = 0.0
 
         elif phase == Phase.LEASEUP:
-            # Ramping occupancy
-            month_in_leaseup = month - inputs.leaseup_start_month + 1
-            target_occupancy = min(month_in_leaseup * inputs.leaseup_pace, inputs.max_occupancy)
-            cf.occupancy_rate = target_occupancy
-
-            # Revenue with escalation
-            market_growth = (1 + inputs.market_rent_growth) ** years_operating
-            affordable_growth = (1 + inputs.affordable_rent_growth) ** years_operating
-
-            cf.gross_potential_rent = (
-                gpr_result.market_gpr_monthly * market_growth
-                + gpr_result.affordable_gpr_monthly * affordable_growth
+            _calculate_operating_period(
+                cf, month, gpr_result, inputs, total_units,
+                tax_result, perm_loan, years_operating,
+                tif_result, incentive_config, is_leaseup=True,
             )
-            cf.vacancy_loss = cf.gross_potential_rent * (1 - cf.occupancy_rate)
-            cf.effective_gross_income = cf.gross_potential_rent - cf.vacancy_loss
-
-            # OpEx with escalation
-            opex_growth = (1 + inputs.opex_growth) ** years_operating
-            fixed_opex_monthly = (total_units * inputs.annual_opex_per_unit / 12) * opex_growth
-            mgmt_monthly = cf.effective_gross_income * inputs.opex_management_pct
-            reserves_monthly = cf.effective_gross_income * inputs.reserves_pct
-
-            cf.operating_expenses = fixed_opex_monthly + mgmt_monthly
-            cf.reserves = reserves_monthly
-
-            # Property taxes with escalation
-            tax_growth = (1 + inputs.property_tax_growth) ** years_operating
-            cf.property_taxes = (tax_result.net_tax_annual / 12) * tax_growth
-
-            # NOI
-            cf.noi = cf.effective_gross_income - cf.operating_expenses - cf.reserves - cf.property_taxes
-
-            # Debt service
-            cf.perm_debt_service = perm_loan.monthly_payment
-
-            # TIF stream payment
-            if tif_result is not None and incentive_config is not None:
-                if incentive_config.toggles.tif_stream:
-                    cf.tif_payment = get_tif_payment_for_month(
-                        tif_result, month, years_operating
-                    )
-
-            cf.unlevered_cf = cf.noi
-            cf.levered_cf = cf.noi + cf.tif_payment - cf.perm_debt_service
 
         elif phase == Phase.OPERATIONS:
-            # Stabilized operations
-            cf.occupancy_rate = inputs.max_occupancy
-
-            # Revenue with escalation
-            market_growth = (1 + inputs.market_rent_growth) ** years_operating
-            affordable_growth = (1 + inputs.affordable_rent_growth) ** years_operating
-
-            cf.gross_potential_rent = (
-                gpr_result.market_gpr_monthly * market_growth
-                + gpr_result.affordable_gpr_monthly * affordable_growth
+            _calculate_operating_period(
+                cf, month, gpr_result, inputs, total_units,
+                tax_result, perm_loan, years_operating,
+                tif_result, incentive_config, is_leaseup=False,
             )
-            cf.vacancy_loss = cf.gross_potential_rent * inputs.vacancy_rate
-            cf.effective_gross_income = cf.gross_potential_rent - cf.vacancy_loss
-
-            # OpEx with escalation
-            opex_growth = (1 + inputs.opex_growth) ** years_operating
-            fixed_opex_monthly = (total_units * inputs.annual_opex_per_unit / 12) * opex_growth
-            mgmt_monthly = cf.effective_gross_income * inputs.opex_management_pct
-            reserves_monthly = cf.effective_gross_income * inputs.reserves_pct
-
-            cf.operating_expenses = fixed_opex_monthly + mgmt_monthly
-            cf.reserves = reserves_monthly
-
-            # Property taxes with escalation
-            tax_growth = (1 + inputs.property_tax_growth) ** years_operating
-            cf.property_taxes = (tax_result.net_tax_annual / 12) * tax_growth
-
-            # NOI
-            cf.noi = cf.effective_gross_income - cf.operating_expenses - cf.reserves - cf.property_taxes
-
-            # Debt service
-            cf.perm_debt_service = perm_loan.monthly_payment
-
-            # TIF stream payment
-            if tif_result is not None and incentive_config is not None:
-                if incentive_config.toggles.tif_stream:
-                    cf.tif_payment = get_tif_payment_for_month(
-                        tif_result, month, years_operating
-                    )
-
-            cf.unlevered_cf = cf.noi
-            cf.levered_cf = cf.noi + cf.tif_payment - cf.perm_debt_service
 
         elif phase == Phase.REVERSION:
             # Sale event
-            # Calculate reversion NOI - use trailing 12 months of actual NOI
-            ops_cfs = [c for c in cash_flows if c.phase in [Phase.OPERATIONS, Phase.LEASEUP]]
-            if ops_cfs:
-                trailing_12_noi = sum(c.noi for c in ops_cfs[-12:])
-                # Annualize if less than 12 months
-                if len(ops_cfs[-12:]) < 12:
-                    trailing_12_noi = trailing_12_noi * 12 / len(ops_cfs[-12:])
-            else:
-                trailing_12_noi = stabilized_noi_annual
-
+            # Calculate reversion NOI based on methodology
             if inputs.reversion_noi_basis == ReversionNOIBasis.FORWARD:
-                # Use forward projection with growth
-                reversion_noi = trailing_12_noi * (1 + inputs.market_rent_growth)
+                # FORWARD: Use stabilized NOI projected 12 months forward from sale
+                # This matches Excel methodology of using month 72 NOI for month 60 sale
+                # Growth is applied from stabilization to 12 months past sale
+                months_since_stabilization = inputs.operations_months + 12  # ops + 12 forward
+                years_of_growth = months_since_stabilization / 12
+                reversion_noi = stabilized_noi_annual * (1 + inputs.market_rent_growth) ** years_of_growth
             else:
+                # TRAILING: Use actual trailing 12 months of NOI
+                ops_cfs = [c for c in cash_flows if c.phase in [Phase.OPERATIONS, Phase.LEASEUP]]
+                if ops_cfs:
+                    trailing_12_noi = sum(c.noi for c in ops_cfs[-12:])
+                    # Annualize if less than 12 months
+                    if len(ops_cfs[-12:]) < 12:
+                        trailing_12_noi = trailing_12_noi * 12 / len(ops_cfs[-12:])
+                else:
+                    trailing_12_noi = stabilized_noi_annual
                 reversion_noi = trailing_12_noi
 
             # Sale price
@@ -437,26 +473,23 @@ def run_dcf(
     result.monthly_cash_flows = cash_flows
 
     # === Calculate IRR ===
-    # Levered IRR: Equity invested at construction start, cash flows during ops, sale proceeds at end
+    # Levered IRR: Equity invested as costs are incurred (per draw schedule),
+    # cash flows during ops, sale proceeds at end
 
     # Build levered cash flow array
-    # Month 0: No cash flow (we'll prepend equity)
-    # Month 1 (construction start): Equity investment
+    # Predevelopment/Construction: Equity contributions (negative) as costs are incurred
     # Operations/Lease-up: Operating cash flows
     # Reversion: Net sale proceeds
 
     levered_cfs: List[float] = []
 
     for cf in cash_flows:
-        if cf.month == inputs.construction_start_month:
-            # Equity investment at construction start
-            levered_cfs.append(-result.equity_required)
-        elif cf.phase in [Phase.PREDEVELOPMENT]:
-            # No cash flows during predevelopment
-            levered_cfs.append(0.0)
-        elif cf.phase == Phase.CONSTRUCTION and cf.month != inputs.construction_start_month:
-            # No cash flows during construction (except equity at start)
-            levered_cfs.append(0.0)
+        if cf.phase in [Phase.PREDEVELOPMENT, Phase.CONSTRUCTION]:
+            # Equity contributions during development (negative = outflow)
+            if cf.equity_contribution > 0:
+                levered_cfs.append(-cf.equity_contribution)
+            else:
+                levered_cfs.append(0.0)
         else:
             levered_cfs.append(cf.levered_cf)
 
@@ -470,17 +503,18 @@ def run_dcf(
     except Exception:
         result.levered_irr = 0.0
 
-    # Unlevered IRR: TDC invested at construction start
+    # Unlevered IRR: TDC invested as costs are incurred (per draw schedule)
     unlevered_cfs: List[float] = []
 
     for cf in cash_flows:
-        if cf.month == inputs.construction_start_month:
-            # TDC investment at construction start
-            unlevered_cfs.append(-result.tdc)
-        elif cf.phase in [Phase.PREDEVELOPMENT]:
-            unlevered_cfs.append(0.0)
-        elif cf.phase == Phase.CONSTRUCTION and cf.month != inputs.construction_start_month:
-            unlevered_cfs.append(0.0)
+        if cf.phase in [Phase.PREDEVELOPMENT, Phase.CONSTRUCTION]:
+            # TDC deployed as costs are incurred
+            # Get the TDC draw for this period from draw schedule
+            period_draw = draw_sched.get_period(cf.month)
+            if period_draw.tdc_draw_total > 0:
+                unlevered_cfs.append(-period_draw.tdc_draw_total)
+            else:
+                unlevered_cfs.append(0.0)
         elif cf.phase == Phase.REVERSION:
             # Sale proceeds (gross, before debt)
             selling_costs = cf.sale_proceeds * inputs.selling_costs_pct

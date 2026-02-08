@@ -25,6 +25,9 @@ class TIFResult:
     start_month: int  # Month when TIF payments begin
     end_month: int  # Month when TIF payments end
 
+    # Repayment analysis
+    repayment_months: int = 0  # Months of stream needed to equal lump sum value
+
 
 def calculate_tif_value(
     city_increment_annual: float,
@@ -103,6 +106,11 @@ def calculate_tif_value(
                 fv=0,
             )
 
+    # Calculate how many months of stream payments equal the lump sum value
+    repayment_months = calculate_repayment_term(
+        capitalized_value, monthly_payment, escalation_rate,
+    )
+
     return TIFResult(
         city_increment_annual=city_increment_annual,
         tif_term_years=tif_term_years,
@@ -113,6 +121,7 @@ def calculate_tif_value(
         annual_payment=annual_payment,
         start_month=tif_start_month,
         end_month=end_month,
+        repayment_months=repayment_months,
     )
 
 
