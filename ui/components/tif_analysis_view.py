@@ -25,6 +25,29 @@ from src.calculations.property_tax import (
     CityTaxAbatement,
     calculate_city_tax_abatement,
 )
+from src.models.incentives import IncentiveTier, TIF_PARAMS, TIER_REQUIREMENTS
+from src.calculations.tif_calculator import (
+    calculate_tif_lump_sum_from_tier,
+    get_tier_tif_defaults,
+    TIFCalculationResult,
+)
+
+
+def parse_currency_input(value: str) -> float:
+    """Parse a currency string (with commas, $, etc.) to float."""
+    if not value:
+        return 0.0
+    # Remove $, commas, spaces
+    cleaned = value.replace("$", "").replace(",", "").replace(" ", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+
+def format_currency_input(value: float) -> str:
+    """Format a float as currency string with commas (no $ sign for input)."""
+    return f"{value:,.0f}"
 
 
 def render_tax_rate_breakdown(tax_stack: Optional[TaxingAuthorityStack] = None) -> None:
@@ -57,73 +80,140 @@ def render_tax_rate_breakdown(tax_stack: Optional[TaxingAuthorityStack] = None) 
 
 
 def render_tif_lump_sum_inputs() -> dict:
-    """Render TIF lump sum calculation inputs and return values."""
+    """Render TIF lump sum calculation inputs and return values.
+
+    Shows the calculated TIF from Scenarios tab by default, with optional manual overrides.
+    """
     st.markdown("### TIF Lump Sum Calculation")
 
-    with st.expander("TIF Lump Sum Inputs", expanded=True):
-        col1, col2 = st.columns(2)
+    # Get selected tier from session state
+    selected_tier_num = st.session_state.get("selected_tier", 2)
+    tier = IncentiveTier(selected_tier_num)
+    tier_defaults = get_tier_tif_defaults(tier)
+    tier_reqs = TIER_REQUIREMENTS[tier]
 
-        with col1:
-            # Assessed values
-            new_assessed_value = st.number_input(
-                "New Assessed Value (TDC)",
-                min_value=0.0,
-                value=st.session_state.get("tif_new_av", 55000000.0),
-                step=1000000.0,
-                format="%.0f",
-                key="tif_new_av",
-                help="Typically equal to TDC or income-based value",
-            )
+    # Get project values from session state (same as Scenarios tab uses)
+    target_units = st.session_state.get("target_units", 200)
+    hard_cost_per_unit = st.session_state.get("hard_cost_per_unit", 155_000)
+    soft_cost_pct = st.session_state.get("soft_cost_pct", 30.0) / 100
+    land_cost = st.session_state.get("land_cost_per_acre", 1_000_000)
+    base_av_default = st.session_state.get("existing_assessed_value", 5_000_000)
 
-            base_assessed_value = st.number_input(
-                "Base Assessed Value",
-                min_value=0.0,
-                value=st.session_state.get("tif_base_av", 5000000.0),
-                step=100000.0,
-                format="%.0f",
-                key="tif_base_av",
-                help="Existing assessed value before development",
-            )
+    # Get affordable_pct - handle both percentage (20) and decimal (0.20) formats
+    affordable_pct_raw = st.session_state.get("affordable_pct", 20.0)
+    affordable_pct = affordable_pct_raw / 100.0 if affordable_pct_raw > 1 else affordable_pct_raw
+    affordable_units_default = max(1, int(target_units * affordable_pct))
 
-            affordable_units = st.number_input(
-                "Affordable Units",
-                min_value=1,
-                value=st.session_state.get("tif_aff_units", 20),
-                step=1,
-                key="tif_aff_units",
-            )
+    # Estimate TDC (same formula as Scenarios tab)
+    hard_costs = target_units * hard_cost_per_unit
+    soft_costs = hard_costs * soft_cost_pct
+    estimated_tdc = land_cost + hard_costs + soft_costs
 
-        with col2:
-            tif_cap_rate = st.slider(
-                "TIF Cap Rate",
-                min_value=5.0,
-                max_value=15.0,
-                value=st.session_state.get("tif_cap_rate", 9.5),
-                step=0.25,
-                format="%.2f%%",
-                key="tif_cap_rate",
-                help="Cap rate for capitalizing tax increment (typically higher than exit cap)",
-            ) / 100
+    # Show what Scenarios tab calculated (if available)
+    scenarios_tif = st.session_state.get("calculated_tif_lump_sum", None)
 
-            discount_rate = st.slider(
-                "Discount Rate",
-                min_value=1.0,
-                max_value=10.0,
-                value=st.session_state.get("tif_discount", 3.0),
-                step=0.25,
-                format="%.2f%%",
-                key="tif_discount",
-                help="Rate for discounting future payments / loan interest rate",
-            ) / 100
+    # Show tier info
+    st.info(f"**Current Tier: {selected_tier_num}** - Cap Rate: {tier_defaults['cap_rate']:.1%}, "
+            f"Term: {tier_defaults['term_years']} years, Escalation: {tier_defaults['escalation_rate']:.1%}")
 
-            tif_term = st.number_input(
-                "TIF Term (years)",
-                min_value=5,
-                max_value=40,
-                value=st.session_state.get("tif_term", 20),
-                step=1,
-                key="tif_term",
-            )
+    if scenarios_tif:
+        st.success(f"**TIF from Scenarios Tab: ${scenarios_tif:,.0f}**")
+
+    use_overrides = st.checkbox(
+        "Enable Manual Overrides (What-If Analysis)",
+        value=st.session_state.get("tif_use_overrides", False),
+        key="tif_use_overrides",
+        help="Override the calculated TIF with custom parameters for what-if analysis"
+    )
+
+    if use_overrides:
+        st.warning("Manual overrides enabled. Values below will differ from Scenarios tab calculation.")
+
+        with st.expander("TIF Manual Overrides", expanded=True):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # New Assessed Value - format with commas
+                # Initialize or reformat existing session state value
+                if "tif_new_av_text" not in st.session_state:
+                    st.session_state["tif_new_av_text"] = f"{estimated_tdc:,.0f}"
+                else:
+                    # Reformat on each render to ensure commas
+                    current_val = parse_currency_input(st.session_state["tif_new_av_text"])
+                    st.session_state["tif_new_av_text"] = f"{current_val:,.0f}"
+
+                new_av_str = st.text_input(
+                    "New Assessed Value (TDC)",
+                    key="tif_new_av_text",
+                    help="Typically equal to TDC or income-based value",
+                )
+                new_assessed_value = parse_currency_input(new_av_str)
+
+                # Base Assessed Value - format with commas
+                if "tif_base_av_text" not in st.session_state:
+                    st.session_state["tif_base_av_text"] = f"{base_av_default:,.0f}"
+                else:
+                    # Reformat on each render to ensure commas
+                    current_val = parse_currency_input(st.session_state["tif_base_av_text"])
+                    st.session_state["tif_base_av_text"] = f"{current_val:,.0f}"
+
+                base_av_str = st.text_input(
+                    "Base Assessed Value",
+                    key="tif_base_av_text",
+                    help="Existing assessed value before development",
+                )
+                base_assessed_value = parse_currency_input(base_av_str)
+
+                affordable_units = st.number_input(
+                    "Affordable Units",
+                    min_value=1,
+                    value=affordable_units_default,
+                    step=1,
+                    key="tif_override_aff_units",
+                )
+
+            with col2:
+                tif_cap_rate = st.slider(
+                    "TIF Cap Rate (Override)",
+                    min_value=5.0,
+                    max_value=15.0,
+                    value=tier_defaults['cap_rate'] * 100,
+                    step=0.25,
+                    format="%.2f%%",
+                    key="tif_override_cap_rate",
+                    help="Cap rate for capitalizing tax increment",
+                ) / 100
+
+                discount_rate = st.slider(
+                    "Escalation Rate (Override)",
+                    min_value=0.0,
+                    max_value=10.0,
+                    value=tier_defaults['escalation_rate'] * 100,
+                    step=0.25,
+                    format="%.2f%%",
+                    key="tif_override_discount",
+                    help="Annual escalation rate for tax increment",
+                ) / 100
+
+                tif_term = st.number_input(
+                    "TIF Term (years) (Override)",
+                    min_value=5,
+                    max_value=40,
+                    value=tier_defaults['term_years'],
+                    step=1,
+                    key="tif_override_term",
+                )
+    else:
+        # Use same values as Scenarios tab (tier defaults applied to project inputs)
+        new_assessed_value = estimated_tdc
+        base_assessed_value = base_av_default
+        affordable_units = affordable_units_default
+        tif_cap_rate = tier_defaults['cap_rate']
+        discount_rate = tier_defaults['escalation_rate']
+        tif_term = tier_defaults['term_years']
+
+        st.caption(f"Using same calculation as Scenarios tab (Tier {selected_tier_num} defaults). "
+                   "Enable overrides above for what-if analysis.")
 
     return {
         "new_assessed_value": new_assessed_value,
@@ -132,6 +222,8 @@ def render_tif_lump_sum_inputs() -> dict:
         "tif_cap_rate": tif_cap_rate,
         "discount_rate": discount_rate,
         "tif_term": tif_term,
+        "tier": tier,
+        "use_overrides": use_overrides,
     }
 
 
@@ -143,20 +235,26 @@ def render_tif_lump_sum_result(
     discount_rate: float,
     tif_term: int,
     tax_stack: Optional[TaxingAuthorityStack] = None,
+    tier: Optional[IncentiveTier] = None,
 ) -> Optional[float]:
     """Calculate and render TIF lump sum result. Returns lump sum amount."""
     if tax_stack is None:
         tax_stack = get_austin_tax_stack()
 
-    # Calculate increment
-    incremental_value = max(0, new_assessed_value - base_assessed_value)
+    if tier is None:
+        tier = IncentiveTier(st.session_state.get("selected_tier", 2))
 
-    # City's annual increment (using participating rate)
-    city_annual_increment = incremental_value * tax_stack.tif_participating_rate_decimal
-
-    # TIF lump sum = annual increment / cap rate
-    # This is the spreadsheet's approach
-    tif_lump_sum = city_annual_increment / tif_cap_rate if tif_cap_rate > 0 else 0
+    # Use the calculator for consistent logic
+    tif_result = calculate_tif_lump_sum_from_tier(
+        new_assessed_value=new_assessed_value,
+        base_assessed_value=base_assessed_value,
+        tier=tier,
+        affordable_units=affordable_units,
+        tax_stack=tax_stack,
+        override_cap_rate=tif_cap_rate,
+        override_term_years=tif_term,
+        override_escalation_rate=discount_rate,
+    )
 
     st.markdown("### TIF Lump Sum Result")
 
@@ -166,33 +264,83 @@ def render_tif_lump_sum_result(
 **Step 1: Calculate Incremental Value**
 - New Assessed Value: ${new_assessed_value:,.0f}
 - Base Assessed Value: ${base_assessed_value:,.0f}
-- **Incremental Value**: ${incremental_value:,.0f}
+- **Incremental Value**: ${tif_result.incremental_value:,.0f}
 
 **Step 2: Calculate Annual City Increment**
-- Incremental Value: ${incremental_value:,.0f}
-- City (TIF) Rate: {tax_stack.tif_participating_rate_per_100:.4f}%
-- **Annual City Increment**: ${city_annual_increment:,.0f}
+- Incremental Value: ${tif_result.incremental_value:,.0f}
+- City (TIF) Rate: {tif_result.city_rate_decimal:.4%}
+- **Annual City Increment**: ${tif_result.annual_city_increment:,.0f}
 
 **Step 3: Capitalize to Lump Sum**
-- Annual City Increment: ${city_annual_increment:,.0f}
+- Annual City Increment: ${tif_result.annual_city_increment:,.0f}
 - Cap Rate: {tif_cap_rate:.2%}
-- **TIF Lump Sum**: ${tif_lump_sum:,.0f}
+- **TIF Lump Sum**: ${tif_result.tif_lump_sum:,.0f}
         """)
 
     # Key metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("TIF Lump Sum", f"${tif_lump_sum:,.0f}")
+        st.metric("TIF Lump Sum", f"${tif_result.tif_lump_sum:,.0f}")
     with col2:
-        per_unit = tif_lump_sum / affordable_units if affordable_units > 0 else 0
-        st.metric("Per Affordable Unit", f"${per_unit:,.0f}")
+        st.metric("Per Affordable Unit", f"${tif_result.per_affordable_unit:,.0f}")
     with col3:
-        pct_of_tdc = tif_lump_sum / new_assessed_value if new_assessed_value > 0 else 0
+        pct_of_tdc = tif_result.tif_lump_sum / new_assessed_value if new_assessed_value > 0 else 0
         st.metric("% of TDC", f"{pct_of_tdc:.2%}")
     with col4:
-        st.metric("Annual Increment", f"${city_annual_increment:,.0f}")
+        st.metric("Annual Increment", f"${tif_result.annual_city_increment:,.0f}")
 
-    return tif_lump_sum
+    # TIF Increment Buildup Schedule
+    st.markdown("### TIF Increment Buildup")
+    st.caption("Shows how the cumulative tax increment builds up over the TIF term.")
+
+    # Create buildup table
+    buildup_data = []
+    for year in range(1, tif_term + 1):
+        year_increment = tif_result.annual_city_increment * ((1 + discount_rate) ** (year - 1))
+        nominal_cumulative = tif_result.buildup_schedule_nominal.get(year, 0)
+        real_cumulative = tif_result.buildup_schedule_real.get(year, 0)
+
+        buildup_data.append({
+            "Year": year,
+            "Annual Increment": year_increment,
+            "Cumulative (Nominal)": nominal_cumulative,
+            "Cumulative (Real $)": real_cumulative,
+        })
+
+    df = pd.DataFrame(buildup_data)
+
+    # Show chart
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Format for display
+        df_display = df.copy()
+        df_display["Annual Increment"] = df_display["Annual Increment"].apply(lambda x: f"${x:,.0f}")
+        df_display["Cumulative (Nominal)"] = df_display["Cumulative (Nominal)"].apply(lambda x: f"${x:,.0f}")
+        df_display["Cumulative (Real $)"] = df_display["Cumulative (Real $)"].apply(lambda x: f"${x:,.0f}")
+
+        st.dataframe(df_display, use_container_width=True, hide_index=True, height=300)
+
+    with col2:
+        # Chart
+        chart_df = df[["Year", "Cumulative (Nominal)", "Cumulative (Real $)"]].copy()
+        chart_df = chart_df.set_index("Year")
+        st.line_chart(chart_df, height=300)
+
+    # Summary row
+    total_nominal = tif_result.buildup_schedule_nominal.get(tif_term, 0)
+    total_real = tif_result.buildup_schedule_real.get(tif_term, 0)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Increment (Nominal)", f"${total_nominal:,.0f}")
+    with col2:
+        st.metric("Total Increment (Real $)", f"${total_real:,.0f}")
+    with col3:
+        st.metric("Lump Sum Equivalent", f"${tif_result.tif_lump_sum:,.0f}",
+                 help="Capitalized value of the increment stream")
+
+    return tif_result.tif_lump_sum
 
 
 def render_tif_loan_schedule(
@@ -280,40 +428,50 @@ def render_tif_loan_schedule(
 
 def render_smart_fee_waiver(
     total_units: int,
-    tier: int = 2,
-) -> SMARTFeeWaiver:
-    """Render SMART fee waiver calculation."""
+) -> Optional[SMARTFeeWaiver]:
+    """Render SMART fee waiver calculation.
+
+    Uses the tier selected on the Scenarios tab (no separate selector here).
+    Only shows values if SMART fee waiver is enabled on Scenarios tab.
+    """
     st.markdown("### SMART Housing Fee Waiver")
 
-    col1, col2 = st.columns(2)
+    # Check if SMART fee waiver is enabled on Scenarios tab
+    smart_enabled = st.session_state.get("smart_fee_waiver", False)
 
-    with col1:
-        selected_tier = st.radio(
-            "SMART Tier",
-            options=[1, 2, 3],
-            index=tier - 1,
-            horizontal=True,
-            key="smart_tier",
-            help="Tier determines affordable % required and waiver amount",
-        )
+    if not smart_enabled:
+        st.info("SMART Fee Waiver is not enabled. Enable it on the **Scenarios** tab to see calculations.")
+        return None
+
+    # Use tier from Scenarios tab
+    selected_tier = st.session_state.get("selected_tier", 2)
 
     waiver = calculate_smart_fee_waiver(tier=selected_tier, total_units=total_units)
 
-    with col2:
+    st.success(f"**Using Tier {selected_tier}** from Scenarios tab")
+
+    col1, col2 = st.columns(2)
+    with col1:
         st.markdown(f"""
         **Tier {selected_tier} Requirements:**
         - Affordable %: {waiver.affordable_pct:.0%}
         - AMI Level: {waiver.ami_level:.0%}
         - Waiver: {waiver.waiver_pct:.0%}
         """)
+    with col2:
+        st.markdown(f"""
+        **Unit Breakdown:**
+        - Total Units: {total_units}
+        - Affordable Units: {waiver.affordable_units}
+        """)
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Affordable Units", f"{waiver.affordable_units}")
-    with col2:
         st.metric("Per Unit Waiver", f"${waiver.per_unit_amount:,.0f}")
-    with col3:
+    with col2:
         st.metric("Total Waiver", f"${waiver.total_waiver:,.0f}")
+    with col3:
+        st.metric("Waiver %", f"{waiver.waiver_pct:.0%}")
 
     return waiver
 
@@ -323,23 +481,53 @@ def render_city_tax_abatement(
     affordable_units: int,
     total_units: int,
 ) -> Optional[CityTaxAbatement]:
-    """Render city tax abatement calculation."""
+    """Render city tax abatement calculation.
+
+    Tax abatement and TIF are mutually exclusive - can't have both.
+    Only shows values if tax abatement is enabled on Scenarios tab and TIF is not selected.
+    """
     st.markdown("### City Property Tax Abatement")
 
-    st.caption("Abatement applies only to the City of Austin's portion of property tax, "
-              "and only on the share attributable to affordable units.")
+    # Check if tax abatement is enabled on Scenarios tab
+    abatement_enabled = st.session_state.get("tax_abatement", False)
 
-    col1, col2, col3 = st.columns(3)
+    # Check if TIF is selected (mutually exclusive with abatement)
+    tif_lump_sum_selected = st.session_state.get("tif_lump_sum", False)
+    tif_stream_selected = st.session_state.get("tif_stream", False)
+    tif_selected = tif_lump_sum_selected or tif_stream_selected
+
+    if tif_selected and abatement_enabled:
+        st.warning("**Tax Abatement and TIF are mutually exclusive.** You have both selected on the Scenarios tab. "
+                  "Please choose one or the other. TIF captures the city's increment, so abatement cannot also apply.")
+        return None
+
+    if not abatement_enabled:
+        st.info("Tax Abatement is not enabled. Enable it on the **Scenarios** tab to see calculations. "
+               "Note: Tax Abatement and TIF Lump Sum are mutually exclusive.")
+        return None
+
+    st.caption("Abatement reduces 100% of the City's property tax increment for the pro rata portion "
+              "attributable to affordable units, based on the selected incentive tier.")
+
+    # Get tier info
+    selected_tier = st.session_state.get("selected_tier", 2)
+    affordable_pct_raw = st.session_state.get("affordable_pct", 20.0)
+    affordable_pct = affordable_pct_raw / 100.0 if affordable_pct_raw > 1 else affordable_pct_raw
+
+    st.success(f"**Using Tier {selected_tier}** from Scenarios tab ({affordable_pct:.0%} affordable)")
+
+    col1, col2 = st.columns(2)
 
     with col1:
         abatement_pct = st.slider(
             "Abatement Percentage",
             min_value=0,
             max_value=100,
-            value=st.session_state.get("abate_pct", 100),
+            value=100,  # Default to 100% abatement
             step=5,
             format="%d%%",
             key="abate_pct",
+            help="Percentage of city tax on affordable units that is abated",
         ) / 100
 
     with col2:
@@ -347,25 +535,39 @@ def render_city_tax_abatement(
             "Abatement Term (years)",
             min_value=1,
             max_value=30,
-            value=st.session_state.get("abate_term", 15),
+            value=15,
             step=1,
             key="abate_term",
+            help="Number of years the abatement applies",
         )
+
+    # Calculate affordable units based on tier
+    calculated_affordable_units = max(1, int(total_units * affordable_pct))
 
     abatement = calculate_city_tax_abatement(
         assessed_value=assessed_value,
         base_assessed_value=0,  # Use full value for abatement calc
         abatement_pct=abatement_pct,
-        affordable_units=affordable_units,
+        affordable_units=calculated_affordable_units,
         total_units=total_units,
         term_years=term_years,
     )
 
-    with col3:
+    st.divider()
+
+    col1, col2 = st.columns(2)
+    with col1:
         st.markdown(f"""
-        **Calculation:**
+        **Calculation Basis:**
         - City Rate: {abatement.city_rate:.4%}
         - Affordable Share: {abatement.affordable_share:.1%}
+        - Affordable Units: {calculated_affordable_units}
+        """)
+    with col2:
+        st.markdown(f"""
+        **Abatement Terms:**
+        - Abatement %: {abatement_pct:.0%}
+        - Term: {term_years} years
         """)
 
     col1, col2, col3 = st.columns(3)
@@ -401,7 +603,11 @@ def render_tif_analysis_tab() -> None:
         discount_rate=inputs["discount_rate"],
         tif_term=inputs["tif_term"],
         tax_stack=tax_stack,
+        tier=inputs.get("tier"),
     )
+
+    # Store calculated TIF lump sum in session state for use by other tabs
+    st.session_state["calculated_tif_lump_sum"] = tif_lump_sum
 
     st.divider()
 

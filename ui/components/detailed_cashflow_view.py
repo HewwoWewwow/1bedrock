@@ -1446,15 +1446,44 @@ def render_property_tax_schedule_table(
 
     # TIF Increment streams
     add_row("TIF Increment", "**TIF Increment (Participating Only)**", [""] * len(years), "", is_header=True)
-    add_row("TIF Increment", "Nominal",
+    add_row("TIF Increment", "Annual (Nominal)",
             [_fmt(v) for v in tif_increment_nominal],
             _fmt(sum(tif_increment_nominal)))
-    add_row("TIF Increment", "Real (Inflation Adj)",
+    add_row("TIF Increment", "Annual (Real)",
             [_fmt(v) for v in tif_increment_real],
             _fmt(sum(tif_increment_real)))
-    add_row("TIF Increment", "**NPV of Increment**",
+    add_row("TIF Increment", "Annual (PV)",
             [_fmt(v) for v in tif_increment_pv],
             _fmt(sum(tif_increment_pv)))
+
+    add_row("", "", [""] * len(years), "")  # Spacer
+
+    # Cumulative buildup - shows how value accumulates from 0 to final
+    cumulative_nominal = []
+    cumulative_real = []
+    cumulative_pv = []
+    running_nominal = 0
+    running_real = 0
+    running_pv = 0
+
+    for i in range(len(years)):
+        running_nominal += tif_increment_nominal[i]
+        running_real += tif_increment_real[i]
+        running_pv += tif_increment_pv[i]
+        cumulative_nominal.append(running_nominal)
+        cumulative_real.append(running_real)
+        cumulative_pv.append(running_pv)
+
+    add_row("TIF Buildup", "**Cumulative Buildup**", [""] * len(years), "", is_header=True)
+    add_row("TIF Buildup", "Cumulative (Nominal)",
+            [_fmt(v) for v in cumulative_nominal],
+            _fmt(cumulative_nominal[-1] if cumulative_nominal else 0))
+    add_row("TIF Buildup", "Cumulative (Real)",
+            [_fmt(v) for v in cumulative_real],
+            _fmt(cumulative_real[-1] if cumulative_real else 0))
+    add_row("TIF Buildup", "**Cumulative (PV)**",
+            [_fmt(v) for v in cumulative_pv],
+            _fmt(cumulative_pv[-1] if cumulative_pv else 0))
 
     # Build HTML table with sticky columns
     year_headers = [str(y) for y in years]
@@ -1561,17 +1590,18 @@ def render_property_tax_engine(
     tdc: float = None,
     start_year: int = 2026,
 ) -> None:
-    """Render the property tax engine UI."""
-    st.subheader("Property Tax Engine")
+    """Render the property tax engine UI - tax components and schedule only (no TIF analysis)."""
+    st.subheader("Property Tax Components")
 
     # If TDC not provided, use stabilized value as proxy
     if tdc is None:
         tdc = stabilized_value
 
     # Taxing authority stack
-    st.markdown("**Taxing Authority Stack**")
+    st.markdown("**Taxing Authority Breakdown**")
+    st.caption("Property taxes in Austin are collected by multiple taxing authorities.")
 
-    # Build table with checkboxes for TIF participation
+    # Build table
     auth_data = []
     for auth in tax_stack.authorities:
         auth_data.append({
@@ -1579,92 +1609,104 @@ def render_property_tax_engine(
             "Code": auth.code,
             "Rate (per $100)": f"${auth.rate_per_100:.4f}",
             "Rate (%)": f"{auth.rate_decimal:.4%}",
-            "Participates in TIF": auth.participates_in_tif,
         })
 
     auth_df = pd.DataFrame(auth_data)
     st.dataframe(auth_df, use_container_width=True, hide_index=True)
 
-    # TIF participation selection
-    st.markdown("**Select TIF Participating Authorities**")
-    participating = []
-    cols = st.columns(len(tax_stack.authorities))
-    for i, auth in enumerate(tax_stack.authorities):
-        with cols[i]:
-            if st.checkbox(auth.code, value=auth.participates_in_tif, key=f"tif_{auth.code}"):
-                participating.append(auth.code)
-
-    # Update participation
-    tax_stack.set_tif_participation(participating)
-
     # Show totals
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         st.metric("Total Tax Rate", f"{tax_stack.total_rate_decimal:.4%}")
     with col2:
-        st.metric("TIF Participating Rate", f"{tax_stack.tif_participating_rate_decimal:.4%}")
-    with col3:
-        st.metric("Non-TIF Rate", f"{tax_stack.non_tif_rate_per_100 / 100:.4%}")
+        annual_tax = tdc * tax_stack.total_rate_decimal
+        st.metric("Est. Year 1 Tax (on TDC)", f"${annual_tax:,.0f}")
 
     st.divider()
 
-    # TIF Analysis parameters
-    st.markdown("**TIF Analysis Parameters**")
+    # Property Tax Projection Parameters
+    st.markdown("**Property Tax Projection**")
 
     col1, col2 = st.columns(2)
     with col1:
-        tif_term = st.slider("TIF Term (years)", 5, 30, 20, key="tif_term")
-        discount_rate = st.slider("Discount Rate", 0.0, 25.0, 8.0, 1.0, key="tif_discount_pct", format="%.0f%%") / 100
-
+        projection_years = st.slider("Projection Years", 5, 30, 20, key="prop_tax_projection_years")
     with col2:
-        inflation_rate = st.slider("Inflation Rate", 0.0, 10.0, 2.0, 0.5, key="tif_inflation_pct", format="%.1f%%") / 100
-        assessment_growth = st.slider("Assessment Growth", 0.0, 10.0, 2.0, 0.5, key="tif_assess_growth_pct", format="%.1f%%") / 100
+        assessment_growth = st.slider("Assessment Growth Rate", 0.0, 10.0, 2.0, 0.5,
+                                     key="prop_tax_assess_growth_pct", format="%.1f%%") / 100
 
     st.divider()
 
     # Detailed Property Tax Schedule
     st.markdown("**Property Tax Schedule (Annual)**")
+    st.caption("Shows estimated property tax by authority over the projection period.")
 
-    render_property_tax_schedule_table(
+    render_property_tax_schedule_simple(
         tax_stack=tax_stack,
         tdc=tdc,
-        baseline_value=baseline_value,
-        tif_term_years=tif_term,
-        discount_rate=discount_rate,
-        inflation_rate=inflation_rate,
+        projection_years=projection_years,
         assessment_growth=assessment_growth,
         start_year=start_year,
     )
 
+
+def render_property_tax_schedule_simple(
+    tax_stack: TaxingAuthorityStack,
+    tdc: float,
+    projection_years: int,
+    assessment_growth: float,
+    start_year: int = 2026,
+) -> None:
+    """Render a simple property tax schedule without TIF complexity."""
+    years = list(range(start_year, start_year + projection_years + 1))
+
+    # Build schedule data
+    schedule_data = []
+    cumulative_tax = 0
+
+    for i, year in enumerate(years):
+        # Assessed value grows over time
+        assessed_val = tdc * ((1 + assessment_growth) ** i)
+
+        # Calculate total tax
+        total_tax = assessed_val * tax_stack.total_rate_decimal
+        cumulative_tax += total_tax
+
+        schedule_data.append({
+            "Year": year,
+            "Assessed Value": assessed_val,
+            "Total Tax": total_tax,
+            "Cumulative Tax": cumulative_tax,
+        })
+
+    df = pd.DataFrame(schedule_data)
+
+    # Display chart and table side by side
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        # Chart
+        chart_df = df[["Year", "Total Tax"]].copy()
+        chart_df = chart_df.set_index("Year")
+        st.line_chart(chart_df, height=300)
+
+    with col2:
+        # Format for display
+        df_display = df.copy()
+        df_display["Assessed Value"] = df_display["Assessed Value"].apply(lambda x: f"${x:,.0f}")
+        df_display["Total Tax"] = df_display["Total Tax"].apply(lambda x: f"${x:,.0f}")
+        df_display["Cumulative Tax"] = df_display["Cumulative Tax"].apply(lambda x: f"${x:,.0f}")
+
+        st.dataframe(df_display, use_container_width=True, hide_index=True, height=300)
+
+    # Summary metrics
     st.divider()
-
-    # Run TIF analysis for summary
-    tif_result = analyze_tif(
-        tax_stack=tax_stack,
-        baseline_assessed_value=baseline_value,
-        stabilized_assessed_value=stabilized_value,
-        tif_term_years=tif_term,
-        discount_rate=discount_rate,
-        inflation_rate=inflation_rate,
-        assessment_growth_rate=assessment_growth,
-    )
-
-    # Display TIF results summary
-    st.markdown("**TIF Results Summary**")
+    total_taxes_paid = cumulative_tax
+    avg_annual_tax = total_taxes_paid / len(years) if years else 0
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Baseline Assessed Value", f"${tif_result.baseline_assessed_value:,.0f}")
-        st.metric("Stabilized Assessed Value", f"${tif_result.stabilized_assessed_value:,.0f}")
-        st.metric("Increment", f"${tif_result.increment_assessed_value:,.0f}")
-
+        st.metric("Year 1 Tax", f"${schedule_data[0]['Total Tax']:,.0f}")
     with col2:
-        st.metric("Annual Increment Tax (Nominal)", f"${tif_result.annual_increment_tax_nominal:,.0f}")
-        st.metric("Annual Increment Tax (Real)", f"${tif_result.annual_increment_tax_real:,.0f}")
-
+        st.metric(f"Year {projection_years} Tax", f"${schedule_data[-1]['Total Tax']:,.0f}")
     with col3:
-        st.metric("NPV Increment (Nominal)", f"${tif_result.npv_increment_nominal:,.0f}")
-        st.metric("NPV Increment (Real)", f"${tif_result.npv_increment_real:,.0f}")
-
-    # Participating authorities
-    st.markdown(f"**Participating Authorities:** {', '.join(tif_result.participating_authorities) or 'None'}")
+        st.metric("Total Over Period", f"${total_taxes_paid:,.0f}")

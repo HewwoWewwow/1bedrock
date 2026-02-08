@@ -1,13 +1,14 @@
 """Scenario configuration UI component."""
 
 import streamlit as st
-from typing import Tuple
+from typing import Tuple, Optional
 
 from src.models.scenario_config import (
     ModelMode, ProjectType, TIFTreatment, TIFConfig,
     ScenarioInputs, ModelConfig, SharedInputs,
     create_default_market_scenario, create_default_mixed_income_scenario,
 )
+from src.models.incentives import IncentiveTier, TIER_REQUIREMENTS
 
 
 def render_mode_selector() -> ModelMode:
@@ -19,250 +20,210 @@ def render_mode_selector() -> ModelMode:
         options=[ModelMode.SINGLE_PROJECT, ModelMode.COMPARISON],
         format_func=lambda x: {
             ModelMode.SINGLE_PROJECT: "Single Project",
-            ModelMode.COMPARISON: "Comparison (Side-by-Side)",
+            ModelMode.COMPARISON: "Comparison (Market vs Mixed-Income)",
         }[x],
         key="model_mode",
         horizontal=True,
-        help="Single Project: Analyze one scenario. Comparison: Compare two scenarios side-by-side."
+        help="Single Project: Analyze one scenario. Comparison: Compare market-rate vs mixed-income side-by-side."
     )
 
     return mode
 
 
-def render_tif_config(prefix: str, default_treatment: TIFTreatment = TIFTreatment.NONE) -> TIFConfig:
-    """Render TIF configuration inputs.
+def render_incentive_config(prefix: str = "mixed") -> dict:
+    """Render the incentive configuration panel.
+
+    This is the main configuration for mixed-income scenarios, including:
+    - Tier selection with editable affordable % and AMI for each tier
+    - Incentive toggles
+    - Calculated TIF lump sum
 
     Args:
-        prefix: Key prefix for session state (e.g., 'scenario_a' or 'scenario_b')
-        default_treatment: Default TIF treatment
+        prefix: Session state key prefix
 
     Returns:
-        TIFConfig with current settings
+        Dict with all incentive configuration values
     """
-    st.markdown("**TIF / Incentive Treatment**")
+    st.markdown("#### Select Incentive Tier")
+    st.caption("Each tier has editable affordability requirements. Select the tier to use.")
 
-    treatment = st.selectbox(
-        "TIF Treatment",
-        options=[t for t in TIFTreatment],
-        format_func=lambda x: {
-            TIFTreatment.NONE: "None - No TIF Benefits",
-            TIFTreatment.LUMP_SUM_CAPITAL: "Lump Sum - Upfront Capital Grant",
-            TIFTreatment.TAX_ABATEMENT: "Tax Abatement - Reduced Property Taxes",
-            TIFTreatment.TIF_STREAM: "TIF Stream - Increment Reimbursement",
-        }[x],
-        key=f"{prefix}_tif_treatment",
-        index=[t for t in TIFTreatment].index(default_treatment),
-    )
+    # Get target units for calculations
+    target_units = st.session_state.get("target_units", 200)
 
-    config = TIFConfig(treatment=treatment)
+    # AMI options
+    ami_options = ["30%", "50%", "60%", "80%"]
 
-    if treatment == TIFTreatment.LUMP_SUM_CAPITAL:
-        st.caption("Upfront capital grant reduces equity needed. Project then pays standard property taxes.")
+    # Initialize tier values from defaults if not set
+    for tier_num in [1, 2, 3]:
+        tier_enum = IncentiveTier(tier_num)
+        tier_reqs = TIER_REQUIREMENTS[tier_enum]
+        default_pct = int(tier_reqs["affordable_pct"] * 100)
+        default_ami = str(tier_reqs["ami_level"])
 
-        col1, col2 = st.columns(2)
-        with col1:
-            input_method = st.radio(
-                "Input Method",
-                options=["Dollar Amount", "% of TDC"],
-                key=f"{prefix}_lump_sum_method",
-                horizontal=True,
-            )
+        if f"{prefix}_tier{tier_num}_pct" not in st.session_state:
+            st.session_state[f"{prefix}_tier{tier_num}_pct"] = default_pct
+        if f"{prefix}_tier{tier_num}_ami" not in st.session_state:
+            st.session_state[f"{prefix}_tier{tier_num}_ami"] = default_ami
 
-        with col2:
-            if input_method == "Dollar Amount":
-                config.lump_sum_amount = st.number_input(
-                    "Lump Sum Amount ($)",
-                    min_value=0,
-                    max_value=50_000_000,
-                    value=st.session_state.get(f"{prefix}_lump_sum_amount", 0),
-                    step=100_000,
-                    format="%d",
-                    key=f"{prefix}_lump_sum_amount",
-                )
-                config.use_lump_sum_pct = False
-            else:
-                config.lump_sum_pct_of_tdc = st.slider(
-                    "Lump Sum (% of TDC)",
-                    min_value=0.0,
-                    max_value=30.0,
-                    value=st.session_state.get(f"{prefix}_lump_sum_pct", 10.0),
-                    step=1.0,
-                    format="%.0f%%",
-                    key=f"{prefix}_lump_sum_pct",
-                ) / 100
-                config.use_lump_sum_pct = True
+    # Tier descriptions
+    tier_names = {
+        1: "Tier 1 - Deep Affordability",
+        2: "Tier 2 - Moderate (More Units)",
+        3: "Tier 3 - Moderate (Balanced)",
+    }
 
-    elif treatment == TIFTreatment.TAX_ABATEMENT:
-        st.caption("Property taxes are reduced for a period. No upfront capital benefit.")
+    # Create columns for each tier
+    cols = st.columns(3)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            config.abatement_pct = st.slider(
-                "Abatement Percentage",
-                min_value=0.0,
-                max_value=100.0,
-                value=st.session_state.get(f"{prefix}_abatement_pct", 100.0),
-                step=5.0,
-                format="%.0f%%",
-                key=f"{prefix}_abatement_pct",
-            ) / 100
+    for i, tier_num in enumerate([1, 2, 3]):
+        with cols[i]:
+            # Tier header with radio selection
+            is_selected = st.session_state.get("selected_tier", 2) == tier_num
 
-        with col2:
-            config.abatement_years = st.number_input(
-                "Abatement Duration (years)",
+            # Selection radio (using container for styling)
+            if st.button(
+                f"{'✓ ' if is_selected else '○ '}{tier_names[tier_num]}",
+                key=f"{prefix}_select_tier_{tier_num}",
+                use_container_width=True,
+                type="primary" if is_selected else "secondary",
+            ):
+                st.session_state["selected_tier"] = tier_num
+                st.rerun()
+
+            # Editable inputs for this tier
+            # Note: value comes from session state (pre-initialized above), so don't set value param
+            tier_pct = st.number_input(
+                "Affordable %",
                 min_value=0,
-                max_value=30,
-                value=st.session_state.get(f"{prefix}_abatement_years", 10),
-                step=1,
-                key=f"{prefix}_abatement_years",
+                max_value=50,
+                step=5,
+                key=f"{prefix}_tier{tier_num}_pct",
+                label_visibility="visible",
             )
 
-        config.abatement_participating_only = st.checkbox(
-            "Participating entities only",
-            value=st.session_state.get(f"{prefix}_abatement_participating", True),
-            key=f"{prefix}_abatement_participating",
-            help="If checked, only TIF-participating entities provide abatement"
-        )
-
-    elif treatment == TIFTreatment.TIF_STREAM:
-        st.caption("Project pays full property taxes, but receives reimbursement of the tax increment from participating entities.")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            config.stream_pct_of_increment = st.slider(
-                "Capture Rate (% of Increment)",
-                min_value=0.0,
-                max_value=100.0,
-                value=st.session_state.get(f"{prefix}_stream_pct", 100.0),
-                step=5.0,
-                format="%.0f%%",
-                key=f"{prefix}_stream_pct",
-                help="Percentage of the tax increment that is reimbursed"
-            ) / 100
-
-        with col2:
-            config.stream_years = st.number_input(
-                "TIF Term (years)",
-                min_value=0,
-                max_value=30,
-                value=st.session_state.get(f"{prefix}_stream_years", 20),
-                step=1,
-                key=f"{prefix}_stream_years",
-            )
-
-    if treatment != TIFTreatment.NONE:
-        config.tif_start_delay_months = st.number_input(
-            "Delay from Stabilization (months)",
-            min_value=0,
-            max_value=24,
-            value=st.session_state.get(f"{prefix}_tif_delay", 0),
-            step=1,
-            key=f"{prefix}_tif_delay",
-            help="Months after stabilization before TIF benefits begin"
-        )
-
-    return config
-
-
-def render_scenario_inputs(
-    prefix: str,
-    scenario_name: str,
-    is_market_default: bool = False,
-    shared_units: int = 200,
-) -> ScenarioInputs:
-    """Render inputs for a single scenario.
-
-    Args:
-        prefix: Key prefix for session state
-        scenario_name: Display name for the scenario
-        is_market_default: If True, defaults to market rate settings
-        shared_units: Base unit count from shared inputs
-
-    Returns:
-        ScenarioInputs with current settings
-    """
-    # Scenario name
-    name = st.text_input(
-        "Scenario Name",
-        value=st.session_state.get(f"{prefix}_name", scenario_name),
-        key=f"{prefix}_name",
-    )
-
-    # Unit configuration
-    st.markdown("**Unit Configuration**")
-
-    total_units = st.number_input(
-        "Total Units",
-        min_value=10,
-        max_value=1000,
-        value=st.session_state.get(f"{prefix}_units", shared_units),
-        step=10,
-        key=f"{prefix}_units",
-        help="Unit count should be determined from site/massing analysis"
-    )
-
-    st.caption("Unit count should reflect site constraints, zoning, parking requirements, "
-              "and any applicable bonuses. Use separate test-fit analysis to determine feasible unit count.")
-
-    # Affordable configuration
-    st.markdown("**Affordable Housing**")
-
-    default_affordable = 0.0 if is_market_default else 20.0
-    affordable_pct = st.slider(
-        "Affordable Percentage",
-        min_value=0.0,
-        max_value=100.0,
-        value=st.session_state.get(f"{prefix}_affordable_pct", default_affordable),
-        step=5.0,
-        format="%.0f%%",
-        key=f"{prefix}_affordable_pct",
-    ) / 100
-
-    affordable_units = int(total_units * affordable_pct)
-    market_units = total_units - affordable_units
-
-    if affordable_pct > 0:
-        col1, col2 = st.columns(2)
-        with col1:
-            ami_level = st.selectbox(
+            # Note: selectbox value comes from session state (pre-initialized above)
+            tier_ami = st.selectbox(
                 "AMI Level",
-                options=["30%", "50%", "60%", "80%", "100%"],
-                index=1,  # Default to 50%
-                key=f"{prefix}_ami_level",
+                options=ami_options,
+                key=f"{prefix}_tier{tier_num}_ami",
+                label_visibility="visible",
             )
-        with col2:
-            st.caption(f"Affordable Units: **{affordable_units}**")
-            st.caption(f"Market Units: **{market_units}**")
+
+            # Show unit counts for this tier
+            tier_affordable = int(target_units * tier_pct / 100)
+            tier_market = target_units - tier_affordable
+            st.caption(f"{tier_affordable} affordable / {tier_market} market")
+
+    # Get selected tier values
+    selected_tier = st.session_state.get("selected_tier", 2)
+    affordable_pct = st.session_state.get(f"{prefix}_tier{selected_tier}_pct", 20)
+    ami_level = st.session_state.get(f"{prefix}_tier{selected_tier}_ami", "50%")
+
+    # Store for use elsewhere
+    st.session_state["affordable_pct"] = float(affordable_pct)
+    st.session_state["ami_level"] = ami_level
+
+    # Get tier enum for later use
+    tier = IncentiveTier(selected_tier)
+
+    # Show selected tier summary
+    affordable_units = int(target_units * affordable_pct / 100)
+    market_units = target_units - affordable_units
+
+    st.divider()
+    st.markdown(f"**Selected: {tier_names[selected_tier]}**")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Units", f"{target_units}")
+    with col2:
+        st.metric("Affordable Units", f"{affordable_units}")
+    with col3:
+        st.metric("Market Units", f"{market_units}")
+
+    st.divider()
+
+    # Incentive toggles
+    st.markdown("#### Incentive Selection")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**Fee Waivers**")
+        smart_fee_waiver = st.checkbox(
+            "SMART Fee Waiver",
+            value=st.session_state.get("smart_fee_waiver", True),
+            key="smart_fee_waiver",
+            help="Waives development fees for affordable units"
+        )
+
+    with col2:
+        st.markdown("**TIF Options**")
+        tif_lump_sum = st.checkbox(
+            "TIF Lump Sum (Upfront)",
+            value=st.session_state.get("tif_lump_sum", True),
+            key="tif_lump_sum",
+            help="Receive TIF as upfront capital grant"
+        )
+        tif_stream = st.checkbox(
+            "TIF Stream (Annual)",
+            value=st.session_state.get("tif_stream", False),
+            key="tif_stream",
+            help="Receive annual TIF payments over time"
+        )
+
+        # Mutual exclusivity warning
+        if tif_lump_sum and tif_stream:
+            st.warning("Select only one TIF option")
+
+    with col3:
+        st.markdown("**Other Incentives**")
+        tax_abatement = st.checkbox(
+            "Tax Abatement",
+            value=st.session_state.get("tax_abatement", False),
+            key="tax_abatement",
+            help="Property tax abatement on affordable units"
+        )
+        interest_buydown = st.checkbox(
+            "Interest Buydown",
+            value=st.session_state.get("interest_buydown", False),
+            key="interest_buydown",
+            help="Reduced interest rate on construction loan"
+        )
+
+    # Determine TIF treatment
+    if tif_lump_sum:
+        tif_treatment = TIFTreatment.LUMP_SUM_CAPITAL
+    elif tif_stream:
+        tif_treatment = TIFTreatment.TIF_STREAM
+    elif tax_abatement:
+        tif_treatment = TIFTreatment.TAX_ABATEMENT
     else:
-        ami_level = "50%"
-        st.caption("No affordable units in this scenario")
+        tif_treatment = TIFTreatment.NONE
 
-    st.divider()
+    st.session_state["scenario_b_tif_treatment"] = tif_treatment
 
-    # TIF Configuration
-    default_tif = TIFTreatment.NONE if is_market_default else TIFTreatment.TIF_STREAM
-    tif_config = render_tif_config(prefix, default_tif)
+    # If TIF lump sum is selected, show note about Property Tax tab
+    if tif_lump_sum:
+        st.info("TIF Lump Sum is configured on the **Property Tax** tab under **TIF Lump Sum Analysis**.")
 
-    st.divider()
+    # Get calculated TIF from Property Tax tab (if available)
+    calculated_tif = st.session_state.get("calculated_tif_lump_sum", 0)
+    if tif_lump_sum:
+        st.session_state["scenario_b_lump_sum_amount"] = int(calculated_tif)
 
-    # Other incentives
-    st.markdown("**Other Incentives**")
-    smart_fee_waiver = st.checkbox(
-        "SMART Fee Waiver",
-        value=st.session_state.get(f"{prefix}_smart_fee", not is_market_default),
-        key=f"{prefix}_smart_fee",
-        help="Fee waiver for affordable housing projects"
-    )
-
-    # Build and return ScenarioInputs
-    return ScenarioInputs(
-        name=name,
-        total_units=total_units,
-        affordable_pct=affordable_pct,
-        ami_level=ami_level,
-        tif_config=tif_config,
-        smart_fee_waiver=smart_fee_waiver,
-    )
+    return {
+        "tier": selected_tier,
+        "affordable_pct": affordable_pct / 100.0,  # Return as decimal
+        "ami_level": ami_level,
+        "smart_fee_waiver": smart_fee_waiver,
+        "tif_lump_sum": tif_lump_sum,
+        "tif_stream": tif_stream,
+        "tax_abatement": tax_abatement,
+        "interest_buydown": interest_buydown,
+        "tif_treatment": tif_treatment,
+        "calculated_tif": calculated_tif,
+    }
 
 
 def render_single_project_config() -> Tuple[ScenarioInputs, ProjectType]:
@@ -271,26 +232,54 @@ def render_single_project_config() -> Tuple[ScenarioInputs, ProjectType]:
     Returns:
         Tuple of (ScenarioInputs, ProjectType)
     """
-    st.subheader("Project Configuration")
+    st.subheader("Project Type")
 
-    # Project type selector
     project_type = st.radio(
-        "Project Type",
+        "Select project type",
         options=[ProjectType.MARKET_RATE, ProjectType.MIXED_INCOME],
         format_func=lambda x: {
-            ProjectType.MARKET_RATE: "Market Rate",
-            ProjectType.MIXED_INCOME: "Mixed Income (with Affordable)",
+            ProjectType.MARKET_RATE: "Market Rate (No Affordable Units)",
+            ProjectType.MIXED_INCOME: "Mixed Income (With Affordable Units)",
         }[x],
         key="single_project_type",
         horizontal=True,
     )
 
     is_market = project_type == ProjectType.MARKET_RATE
-    scenario = render_scenario_inputs(
-        prefix="single",
-        scenario_name="Market Rate" if is_market else "Mixed Income",
-        is_market_default=is_market,
-    )
+
+    if is_market:
+        st.info("Market-rate project with no affordable units or incentives. Configure project details on the **Project Inputs** tab.")
+
+        # Build minimal scenario
+        scenario = ScenarioInputs(
+            name="Market Rate",
+            total_units=st.session_state.get("target_units", 200),
+            affordable_pct=0.0,
+            ami_level="50%",
+            smart_fee_waiver=False,
+            tif_config=TIFConfig(treatment=TIFTreatment.NONE),
+        )
+    else:
+        st.divider()
+        st.subheader("Mixed-Income Configuration")
+
+        # Render full incentive configuration
+        config = render_incentive_config(prefix="single")
+
+        # Build scenario from config
+        tif_config = TIFConfig(
+            treatment=config["tif_treatment"],
+            lump_sum_amount=int(config["calculated_tif"]) if config["tif_lump_sum"] else 0,
+        )
+
+        scenario = ScenarioInputs(
+            name="Mixed Income",
+            total_units=st.session_state.get("target_units", 200),
+            affordable_pct=config["affordable_pct"],
+            ami_level=config["ami_level"],
+            smart_fee_waiver=config["smart_fee_waiver"],
+            tif_config=tif_config,
+        )
 
     return scenario, project_type
 
@@ -301,25 +290,49 @@ def render_comparison_config() -> Tuple[ScenarioInputs, ScenarioInputs]:
     Returns:
         Tuple of (scenario_a, scenario_b)
     """
-    st.subheader("Comparison Configuration")
-    st.caption("Configure two scenarios to compare side-by-side")
+    # Get shared unit count
+    target_units = st.session_state.get("target_units", 200)
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("### Scenario A")
-        scenario_a = render_scenario_inputs(
-            prefix="scenario_a",
-            scenario_name="Market Rate",
-            is_market_default=True,
+        st.subheader("Scenario A: Market Rate")
+        st.info(f"""
+        **{target_units} units** at market rate
+        - No affordable units
+        - No incentives
+        - No TIF
+        """)
+
+        # Build market scenario
+        scenario_a = ScenarioInputs(
+            name="Market Rate",
+            total_units=target_units,
+            affordable_pct=0.0,
+            ami_level="50%",
+            smart_fee_waiver=False,
+            tif_config=TIFConfig(treatment=TIFTreatment.NONE),
         )
 
     with col2:
-        st.markdown("### Scenario B")
-        scenario_b = render_scenario_inputs(
-            prefix="scenario_b",
-            scenario_name="Mixed Income",
-            is_market_default=False,
+        st.subheader("Scenario B: Mixed Income")
+
+        # Render full incentive configuration
+        config = render_incentive_config(prefix="scenario_b")
+
+        # Build mixed-income scenario from config
+        tif_config = TIFConfig(
+            treatment=config["tif_treatment"],
+            lump_sum_amount=int(config["calculated_tif"]) if config["tif_lump_sum"] else 0,
+        )
+
+        scenario_b = ScenarioInputs(
+            name="Mixed Income",
+            total_units=target_units,
+            affordable_pct=config["affordable_pct"],
+            ami_level=config["ami_level"],
+            smart_fee_waiver=config["smart_fee_waiver"],
+            tif_config=tif_config,
         )
 
     return scenario_a, scenario_b
@@ -347,65 +360,68 @@ def render_scenario_summary(scenario: ScenarioInputs) -> None:
 def get_model_config_from_session() -> ModelConfig:
     """Build ModelConfig from session state."""
     mode = st.session_state.get("model_mode", ModelMode.COMPARISON)
+    target_units = st.session_state.get("target_units", 200)
 
     config = ModelConfig(mode=mode)
 
     if mode == ModelMode.SINGLE_PROJECT:
-        # Get single project config
         project_type = st.session_state.get("single_project_type", ProjectType.MIXED_INCOME)
         config.single_project_type = project_type
 
-        # Build scenario from session state
-        config.single_scenario = ScenarioInputs(
-            name=st.session_state.get("single_name", "Project"),
-            total_units=st.session_state.get("single_units", 200),
-            affordable_pct=st.session_state.get("single_affordable_pct", 0.0) / 100,
-            ami_level=st.session_state.get("single_ami_level", "50%"),
-            smart_fee_waiver=st.session_state.get("single_smart_fee", False),
-            tif_config=TIFConfig(
-                treatment=st.session_state.get("single_tif_treatment", TIFTreatment.NONE),
-                lump_sum_amount=st.session_state.get("single_lump_sum_amount", 0),
-                lump_sum_pct_of_tdc=st.session_state.get("single_lump_sum_pct", 0) / 100,
-                abatement_pct=st.session_state.get("single_abatement_pct", 0) / 100,
-                abatement_years=st.session_state.get("single_abatement_years", 0),
-                stream_pct_of_increment=st.session_state.get("single_stream_pct", 100) / 100,
-                stream_years=st.session_state.get("single_stream_years", 20),
-            ),
-        )
+        if project_type == ProjectType.MARKET_RATE:
+            config.single_scenario = ScenarioInputs(
+                name="Market Rate",
+                total_units=target_units,
+                affordable_pct=0.0,
+                ami_level="50%",
+                smart_fee_waiver=False,
+                tif_config=TIFConfig(treatment=TIFTreatment.NONE),
+            )
+        else:
+            # Mixed income - get values from session state
+            affordable_pct_raw = st.session_state.get("affordable_pct", 20.0)
+            affordable_pct = affordable_pct_raw / 100.0 if affordable_pct_raw > 1 else affordable_pct_raw
+
+            tif_treatment = st.session_state.get("scenario_b_tif_treatment", TIFTreatment.NONE)
+
+            config.single_scenario = ScenarioInputs(
+                name="Mixed Income",
+                total_units=target_units,
+                affordable_pct=affordable_pct,
+                ami_level=st.session_state.get("ami_level", "50%"),
+                smart_fee_waiver=st.session_state.get("smart_fee_waiver", True),
+                tif_config=TIFConfig(
+                    treatment=tif_treatment,
+                    lump_sum_amount=st.session_state.get("scenario_b_lump_sum_amount", 0),
+                ),
+            )
     else:
-        # Build scenario A
+        # Comparison mode
+        affordable_pct_raw = st.session_state.get("affordable_pct", 20.0)
+        affordable_pct = affordable_pct_raw / 100.0 if affordable_pct_raw > 1 else affordable_pct_raw
+
+        tif_treatment = st.session_state.get("scenario_b_tif_treatment", TIFTreatment.NONE)
+
+        # Scenario A: Market Rate
         config.scenario_a = ScenarioInputs(
-            name=st.session_state.get("scenario_a_name", "Market Rate"),
-            total_units=st.session_state.get("scenario_a_units", 200),
-            affordable_pct=st.session_state.get("scenario_a_affordable_pct", 0.0) / 100,
-            ami_level=st.session_state.get("scenario_a_ami_level", "50%"),
-            smart_fee_waiver=st.session_state.get("scenario_a_smart_fee", False),
-            tif_config=TIFConfig(
-                treatment=st.session_state.get("scenario_a_tif_treatment", TIFTreatment.NONE),
-                lump_sum_amount=st.session_state.get("scenario_a_lump_sum_amount", 0),
-                lump_sum_pct_of_tdc=st.session_state.get("scenario_a_lump_sum_pct", 0) / 100,
-                abatement_pct=st.session_state.get("scenario_a_abatement_pct", 0) / 100,
-                abatement_years=st.session_state.get("scenario_a_abatement_years", 0),
-                stream_pct_of_increment=st.session_state.get("scenario_a_stream_pct", 100) / 100,
-                stream_years=st.session_state.get("scenario_a_stream_years", 20),
-            ),
+            name="Market Rate",
+            total_units=target_units,
+            affordable_pct=0.0,
+            ami_level="50%",
+            smart_fee_waiver=False,
+            tif_config=TIFConfig(treatment=TIFTreatment.NONE),
         )
 
-        # Build scenario B
+        # Scenario B: Mixed Income
         config.scenario_b = ScenarioInputs(
-            name=st.session_state.get("scenario_b_name", "Mixed Income"),
-            total_units=st.session_state.get("scenario_b_units", 200),
-            affordable_pct=st.session_state.get("scenario_b_affordable_pct", 20.0) / 100,
-            ami_level=st.session_state.get("scenario_b_ami_level", "50%"),
-            smart_fee_waiver=st.session_state.get("scenario_b_smart_fee", True),
+            name="Mixed Income",
+            total_units=target_units,
+            affordable_pct=affordable_pct,
+            ami_level=st.session_state.get("ami_level", "50%"),
+            smart_fee_waiver=st.session_state.get("smart_fee_waiver", True),
             tif_config=TIFConfig(
-                treatment=st.session_state.get("scenario_b_tif_treatment", TIFTreatment.TIF_STREAM),
+                treatment=tif_treatment,
                 lump_sum_amount=st.session_state.get("scenario_b_lump_sum_amount", 0),
-                lump_sum_pct_of_tdc=st.session_state.get("scenario_b_lump_sum_pct", 0) / 100,
-                abatement_pct=st.session_state.get("scenario_b_abatement_pct", 0) / 100,
-                abatement_years=st.session_state.get("scenario_b_abatement_years", 0),
-                stream_pct_of_increment=st.session_state.get("scenario_b_stream_pct", 100) / 100,
-                stream_years=st.session_state.get("scenario_b_stream_years", 20),
             ),
         )
 

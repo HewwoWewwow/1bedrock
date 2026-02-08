@@ -9,6 +9,7 @@ sys.path.insert(0, str(project_root))
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 from datetime import date
 
 from src.models.project import ProjectInputs, Scenario, UnitMixEntry, TIFStartTiming
@@ -45,6 +46,12 @@ from ui.components.scenario_config_view import (
     render_mode_selector, render_single_project_config, render_comparison_config,
     render_scenario_summary, get_model_config_from_session,
 )
+from src.calculations.monte_carlo import (
+    DistributionType, InputDistribution, BaseInputs,
+    MonteCarloConfig, run_monte_carlo, run_tif_grid_search,
+)
+from src.calculations.detailed_cashflow import AssessedValueBasis
+import numpy as np
 
 # Page configuration
 st.set_page_config(
@@ -101,11 +108,12 @@ def _get_tif_treatment_str() -> str:
         return "none"
 
 
-def get_inputs_for_scenario(scenario: ScenarioInputs = None) -> ProjectInputs:
+def get_inputs_for_scenario(scenario: ScenarioInputs = None, is_mixed_income: bool = False) -> ProjectInputs:
     """Build ProjectInputs from session state, optionally overriding with scenario-specific values.
 
     Args:
         scenario: Optional ScenarioInputs to override unit count, affordable %, etc.
+        is_mixed_income: If True, read from mixed income inputs (mixed_ prefix)
 
     Returns:
         ProjectInputs configured for the scenario
@@ -122,10 +130,22 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None) -> ProjectInputs:
         target_units = scenario.total_units
         affordable_pct = scenario.affordable_pct
         ami_level = scenario.ami_level
+        # Determine if this is mixed income based on affordable_pct
+        is_mixed_income = affordable_pct > 0
     else:
         target_units = st.session_state.get("target_units", 200)
         affordable_pct = st.session_state.get("affordable_pct", 20.0) / 100
         ami_level = st.session_state.get("ami_level", "50%")
+
+    # Determine prefix for reading inputs
+    prefix = "mixed_" if is_mixed_income else ""
+
+    # Helper to get value from appropriate source
+    def get_val(key: str, default, as_pct: bool = False):
+        """Get value from market or mixed income inputs based on scenario."""
+        full_key = f"{prefix}{key}" if prefix else key
+        val = st.session_state.get(full_key, st.session_state.get(key, default))
+        return val / 100 if as_pct else val
 
     # Build incentive config
     incentive_config = None
@@ -139,7 +159,7 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None) -> ProjectInputs:
             interest_buydown=False,
         )
         incentive_config = get_tier_config(tier, toggles)
-    elif st.session_state.get("run_mixed", True):
+    elif st.session_state.get("run_mixed", True) and is_mixed_income:
         tier = IncentiveTier(st.session_state.get("selected_tier", 2))
         toggles = IncentiveToggles(
             smart_fee_waiver=st.session_state.get("smart_fee_waiver", True),
@@ -152,38 +172,38 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None) -> ProjectInputs:
 
     return ProjectInputs(
         predevelopment_start=date(2026, 1, 1),
-        predevelopment_months=st.session_state.get("predevelopment_months", 18),
-        construction_months=st.session_state.get("construction_months", 24),
-        leaseup_months=st.session_state.get("leaseup_months", 12),
-        operations_months=st.session_state.get("operations_months", 12),
-        land_cost_per_acre=st.session_state.get("land_cost_per_acre", 1_000_000),
+        predevelopment_months=get_val("predevelopment_months", 18),
+        construction_months=get_val("construction_months", 24),
+        leaseup_months=get_val("leaseup_months", 12),
+        operations_months=get_val("operations_months", 12),
+        land_cost_per_acre=get_val("land_cost_per_acre", 1_000_000),
         target_units=target_units,
-        hard_cost_per_unit=st.session_state.get("hard_cost_per_unit", 155_000),
-        soft_cost_pct=st.session_state.get("soft_cost_pct", 30.0) / 100,
+        hard_cost_per_unit=get_val("hard_cost_per_unit", 155_000),
+        soft_cost_pct=get_val("soft_cost_pct", 30.0, as_pct=True),
         construction_type=ConstructionType(st.session_state.get("construction_type", "podium_midrise_5over1")),
         unit_mix=unit_mix,
         market_rent_psf=st.session_state.get("market_rent_psf", 2.50),
-        vacancy_rate=st.session_state.get("vacancy_rate_pct", 6.0) / 100,
-        leaseup_pace=st.session_state.get("leaseup_pace_pct", 8.0) / 100,
+        vacancy_rate=get_val("vacancy_rate_pct", 6.0, as_pct=True),
+        leaseup_pace=get_val("leaseup_pace_pct", 8.0, as_pct=True),
         max_occupancy=st.session_state.get("max_occupancy", 0.94),
-        opex_utilities=st.session_state.get("opex_utilities", 1200),
-        opex_management_pct=st.session_state.get("opex_management_pct", 5.0) / 100,
-        opex_maintenance=st.session_state.get("opex_maintenance", 1500),
+        opex_utilities=get_val("opex_utilities", 1200),
+        opex_management_pct=get_val("opex_management_pct", 5.0, as_pct=True),
+        opex_maintenance=get_val("opex_maintenance", 1500),
         opex_misc=st.session_state.get("opex_misc", 650),
         reserves_pct=st.session_state.get("reserves_pct", 0.02),
-        market_rent_growth=st.session_state.get("market_rent_growth_pct", 2.0) / 100,
-        affordable_rent_growth=st.session_state.get("affordable_rent_growth_pct", 1.0) / 100,
-        opex_growth=st.session_state.get("opex_growth_pct", 3.0) / 100,
-        property_tax_growth=st.session_state.get("property_tax_growth_pct", 2.0) / 100,
-        construction_rate=st.session_state.get("construction_rate_pct", 7.5) / 100,
-        construction_ltc=st.session_state.get("construction_ltc_pct", 65.0) / 100,
-        perm_rate=st.session_state.get("perm_rate_pct", 6.0) / 100,
-        perm_amort_years=st.session_state.get("perm_amort_years", 20),
-        perm_ltv_max=st.session_state.get("perm_ltv_max_pct", 65.0) / 100,
-        perm_dscr_min=st.session_state.get("perm_dscr_min", 1.25),
-        existing_assessed_value=st.session_state.get("existing_assessed_value", 5_000_000),
+        market_rent_growth=get_val("market_rent_growth_pct", 2.0, as_pct=True),
+        affordable_rent_growth=get_val("affordable_rent_growth_pct", 1.0, as_pct=True),
+        opex_growth=get_val("opex_growth_pct", 3.0, as_pct=True),
+        property_tax_growth=get_val("property_tax_growth_pct", 2.0, as_pct=True),
+        construction_rate=get_val("construction_rate_pct", 7.5, as_pct=True),
+        construction_ltc=get_val("construction_ltc_pct", 65.0, as_pct=True),
+        perm_rate=get_val("perm_rate_pct", 6.0, as_pct=True),
+        perm_amort_years=get_val("perm_amort_years", 20),
+        perm_ltv_max=get_val("perm_ltv_max_pct", 65.0, as_pct=True),
+        perm_dscr_min=get_val("perm_dscr_min", 1.25),
+        existing_assessed_value=get_val("existing_assessed_value", 5_000_000),
         tax_rates=DEFAULT_TAX_RATES.copy(),
-        exit_cap_rate=st.session_state.get("exit_cap_rate_pct", 5.5) / 100,
+        exit_cap_rate=get_val("exit_cap_rate_pct", 5.5, as_pct=True),
         affordable_pct=affordable_pct,
         ami_level=ami_level,
         incentive_config=incentive_config,
@@ -193,6 +213,8 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None) -> ProjectInputs:
 
 def get_session_state_inputs() -> ProjectInputs:
     """Build ProjectInputs from session state."""
+    from src.models.incentives import TIER_REQUIREMENTS
+
     # Get efficiency from construction type
     construction_type = st.session_state.get("construction_type", "podium_midrise_5over1")
     efficiency = get_efficiency(construction_type)
@@ -200,15 +222,41 @@ def get_session_state_inputs() -> ProjectInputs:
     # Unit mix from session state (using new component)
     unit_mix = get_unit_mix_from_session_state(efficiency)
 
+    # Sync affordable_pct with selected tier to ensure consistency
+    # This is needed because the Scenarios tab might not have run yet
+    selected_tier = st.session_state.get("selected_tier", 2)
+    tier_enum = IncentiveTier(selected_tier)
+    tier_reqs = TIER_REQUIREMENTS[tier_enum]
+
+    # Get affordable_pct from tier-specific key, or fall back to tier default
+    tier_key = f"scenario_b_tier{selected_tier}_pct"
+    if tier_key in st.session_state:
+        affordable_pct_value = st.session_state[tier_key]
+    else:
+        affordable_pct_value = tier_reqs["affordable_pct"] * 100  # Convert to percentage
+
+    # Get AMI level from tier-specific key, or fall back to tier default
+    ami_key = f"scenario_b_tier{selected_tier}_ami"
+    if ami_key in st.session_state:
+        ami_level_value = st.session_state[ami_key]
+    else:
+        ami_level_value = str(tier_reqs["ami_level"])
+
+    # Update the global values to match the selected tier
+    st.session_state["affordable_pct"] = float(affordable_pct_value)
+    st.session_state["ami_level"] = ami_level_value
+
     # Build incentive config if in mixed-income mode
     incentive_config = None
     if st.session_state.get("run_mixed", True):
-        tier = IncentiveTier(st.session_state.get("selected_tier", 2))
+        tier = IncentiveTier(selected_tier)
+        # NOTE: Defaults here must match scenario_config_view.py defaults
+        # Default: TIF lump sum ON, TIF stream OFF, SMART ON
         toggles = IncentiveToggles(
             smart_fee_waiver=st.session_state.get("smart_fee_waiver", True),
             tax_abatement=st.session_state.get("tax_abatement", False),
-            tif_lump_sum=st.session_state.get("tif_lump_sum", False),
-            tif_stream=st.session_state.get("tif_stream", True),
+            tif_lump_sum=st.session_state.get("tif_lump_sum", True),
+            tif_stream=st.session_state.get("tif_stream", False),
             interest_buydown=st.session_state.get("interest_buydown", False),
         )
         incentive_config = get_tier_config(tier, toggles)
@@ -266,13 +314,15 @@ def run_analysis(inputs: ProjectInputs, scenario_a: ScenarioInputs = None, scena
         Tuple of (market_result, mixed_result, market_metrics, mixed_metrics, comparison)
     """
     # Build inputs for each scenario if provided
+    # Scenario A is market rate (no mixed income overrides)
     if scenario_a:
-        inputs_a = get_inputs_for_scenario(scenario_a)
+        inputs_a = get_inputs_for_scenario(scenario_a, is_mixed_income=False)
     else:
         inputs_a = inputs
 
+    # Scenario B is mixed income (use mixed income overrides)
     if scenario_b:
-        inputs_b = get_inputs_for_scenario(scenario_b)
+        inputs_b = get_inputs_for_scenario(scenario_b, is_mixed_income=True)
     else:
         inputs_b = inputs
 
@@ -303,7 +353,7 @@ def run_analysis(inputs: ProjectInputs, scenario_a: ScenarioInputs = None, scena
     return market_result, mixed_result, market_metrics, mixed_metrics, comparison
 
 
-def currency_input(label: str, key: str, default: int, min_val: int = 0, max_val: int = 100_000_000) -> int:
+def currency_input(label: str, key: str, default: int, min_val: int = 0, max_val: int = 100_000_000, help: str = None) -> int:
     """Render a currency input with comma formatting.
 
     Args:
@@ -312,6 +362,7 @@ def currency_input(label: str, key: str, default: int, min_val: int = 0, max_val
         default: Default value
         min_val: Minimum allowed value
         max_val: Maximum allowed value
+        help: Optional help text tooltip
 
     Returns:
         The numeric value entered
@@ -323,7 +374,7 @@ def currency_input(label: str, key: str, default: int, min_val: int = 0, max_val
     formatted = f"${current_val:,}"
 
     # Render text input
-    user_input = st.text_input(label, value=formatted, key=f"{key}_text")
+    user_input = st.text_input(label, value=formatted, key=f"{key}_text", help=help)
 
     # Parse the input - strip $ and commas
     try:
@@ -341,41 +392,141 @@ def currency_input(label: str, key: str, default: int, min_val: int = 0, max_val
 
 
 def render_sidebar():
-    """Render the sidebar with key inputs."""
-    st.sidebar.header("Quick Settings")
+    """Render the sidebar as a two-column Deal Summary (Market | Mixed Income)."""
+    st.sidebar.header("Deal Summary")
 
-    # Show current mode
+    # Check mode
     mode = st.session_state.get("model_mode", ModelMode.COMPARISON)
-    if mode == ModelMode.SINGLE_PROJECT:
-        project_type = st.session_state.get("single_project_type", ProjectType.MIXED_INCOME)
-        st.sidebar.info(f"Mode: **Single Project** ({project_type.value.replace('_', ' ').title()})")
-    else:
-        st.sidebar.info("Mode: **Comparison** (Market vs Mixed Income)")
+    is_comparison = mode == ModelMode.COMPARISON
 
-    st.sidebar.divider()
-
-    # Try to show live metrics at the top
+    # Try to calculate metrics
     try:
         inputs = get_session_state_inputs()
         market_result, mixed_result, market_metrics, mixed_metrics, comparison = run_analysis(inputs)
 
-        # Display key metrics
-        st.sidebar.subheader("Returns")
+        # For single project mode, determine which scenario is active
+        if not is_comparison:
+            project_type = st.session_state.get("single_project_type", ProjectType.MIXED_INCOME)
+            is_market_only = project_type == ProjectType.MARKET_RATE
+        else:
+            is_market_only = False
+
+        # ========== COLUMN HEADERS ==========
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            st.markdown("**Market Rate**")
+        with col2:
+            st.markdown("**Mixed Income**")
+
+        st.sidebar.divider()
+
+        # ========== RETURNS ==========
+        # IRR
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            st.metric("IRR", f"{market_metrics.levered_irr:.1%}")
+        with col2:
+            if is_comparison or not is_market_only:
+                st.metric("IRR", f"{mixed_metrics.levered_irr:.1%}")
+            else:
+                st.metric("IRR", "—")
+
+        # Equity Multiple
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            st.metric("Equity Mult", f"{market_metrics.equity_multiple:.2f}x")
+        with col2:
+            if is_comparison or not is_market_only:
+                st.metric("Equity Mult", f"{mixed_metrics.equity_multiple:.2f}x")
+            else:
+                st.metric("Equity Mult", "—")
+
+        # IRR Difference (comparison mode only)
+        if is_comparison:
+            irr_diff = comparison.irr_difference_bps
+            if comparison.meets_target:
+                st.sidebar.success(f"**Δ {irr_diff:+d} bps** ✓")
+            else:
+                st.sidebar.warning(f"**Δ {irr_diff:+d} bps** (need +150)")
+
+        st.sidebar.divider()
+
+        # ========== UNITS ==========
+        total_units = st.session_state.get("target_units", 200)
+        affordable_pct = st.session_state.get("affordable_pct", 20.0)
+        if affordable_pct > 1:
+            affordable_pct = affordable_pct / 100
+        affordable_units = int(total_units * affordable_pct)
+        market_units_mixed = total_units - affordable_units
+        ami_level = st.session_state.get("ami_level", "50%")
 
         col1, col2 = st.sidebar.columns(2)
         with col1:
-            st.metric("Market IRR", f"{market_metrics.levered_irr:.1%}")
+            st.caption("Units")
+            st.markdown(f"{total_units} total")
+            st.markdown("0 affordable")
         with col2:
-            st.metric("Mixed IRR", f"{mixed_metrics.levered_irr:.1%}")
+            st.caption("Units")
+            if is_comparison or not is_market_only:
+                st.markdown(f"{market_units_mixed} market")
+                st.markdown(f"{affordable_units} @ {ami_level}")
+            else:
+                st.markdown("—")
+                st.markdown("—")
 
-        # IRR difference
-        irr_diff = comparison.irr_difference_bps
-        if comparison.meets_target:
-            st.sidebar.success(f"IRR Δ: **{irr_diff:+d} bps** ✓")
-        else:
-            st.sidebar.warning(f"IRR Δ: **{irr_diff:+d} bps**")
+        st.sidebar.divider()
 
-        # Calculate NPV (sum of discounted cash flows)
+        # ========== CAPITAL STACK ==========
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            st.caption("Capital")
+            st.markdown(f"TDC ${market_metrics.tdc/1e6:.1f}M")
+            st.markdown(f"Debt ${market_metrics.debt_amount/1e6:.1f}M")
+            st.markdown(f"Equity ${market_metrics.equity_required/1e6:.1f}M")
+            st.markdown("TIF $0")
+        with col2:
+            st.caption("Capital")
+            if is_comparison or not is_market_only:
+                st.markdown(f"TDC ${mixed_metrics.tdc/1e6:.1f}M")
+                st.markdown(f"Debt ${mixed_metrics.debt_amount/1e6:.1f}M")
+                st.markdown(f"Equity ${mixed_metrics.equity_required/1e6:.1f}M")
+                tif_val = mixed_metrics.tif_value if hasattr(mixed_metrics, 'tif_value') else 0
+                st.markdown(f"TIF ${tif_val/1e6:.1f}M")
+            else:
+                st.markdown("—")
+                st.markdown("—")
+                st.markdown("—")
+                st.markdown("—")
+
+        st.sidebar.divider()
+
+        # ========== OPERATING METRICS ==========
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            st.caption("Operations")
+            st.markdown(f"GPR ${market_metrics.gpr_annual/1e6:.2f}M")
+            st.markdown(f"NOI ${market_metrics.noi_annual/1e6:.2f}M")
+            st.markdown(f"YoC {market_metrics.yield_on_cost:.1%}")
+        with col2:
+            st.caption("Operations")
+            if is_comparison or not is_market_only:
+                st.markdown(f"GPR ${mixed_metrics.gpr_annual/1e6:.2f}M")
+                st.markdown(f"NOI ${mixed_metrics.noi_annual/1e6:.2f}M")
+                st.markdown(f"YoC {mixed_metrics.yield_on_cost:.1%}")
+            else:
+                st.markdown("—")
+                st.markdown("—")
+                st.markdown("—")
+
+        st.sidebar.divider()
+
+        # ========== NPV (EDITABLE DISCOUNT RATE) ==========
+        npv_discount = st.sidebar.slider(
+            "NPV Discount Rate",
+            min_value=5, max_value=25, value=15, step=1,
+            key="npv_discount_rate", format="%d%%"
+        ) / 100.0
+
         def calc_npv(cash_flows, rate):
             monthly_rate = (1 + rate) ** (1/12) - 1
             npv = 0
@@ -383,74 +534,49 @@ def render_sidebar():
                 npv += cf.levered_cf / ((1 + monthly_rate) ** i)
             return npv
 
-        # NPV side by side with discount sliders underneath
+        market_npv = calc_npv(market_result.monthly_cash_flows, npv_discount)
+        mixed_npv = calc_npv(mixed_result.monthly_cash_flows, npv_discount)
+
         col1, col2 = st.sidebar.columns(2)
         with col1:
-            market_discount = st.slider(
-                "Disc %", min_value=0, max_value=30, value=15, step=1,
-                key="market_discount_rate", format="%d%%"
-            ) / 100.0
-            market_npv = calc_npv(market_result.monthly_cash_flows, market_discount)
-            st.metric("Market NPV", f"${market_npv/1e6:.1f}M")
+            st.metric("NPV", f"${market_npv/1e6:.1f}M")
         with col2:
-            mixed_discount = st.slider(
-                "Disc %", min_value=0, max_value=30, value=15, step=1,
-                key="mixed_discount_rate", format="%d%%"
-            ) / 100.0
-            mixed_npv = calc_npv(mixed_result.monthly_cash_flows, mixed_discount)
-            st.metric("Mixed NPV", f"${mixed_npv/1e6:.1f}M")
+            if is_comparison or not is_market_only:
+                st.metric("NPV", f"${mixed_npv/1e6:.1f}M")
+            else:
+                st.metric("NPV", "—")
 
         st.sidebar.divider()
 
-    except Exception:
-        # Show placeholder on first run or if analysis fails
-        st.sidebar.info("Adjust inputs to see returns")
-        st.sidebar.divider()
+        # ========== KEY ASSUMPTIONS (SHARED) ==========
+        st.sidebar.caption("**Key Assumptions**")
 
-    st.sidebar.subheader("Construction")
-    st.sidebar.selectbox(
-        "Construction Type",
-        options=[ct.value for ct in ConstructionType],
-        index=2,  # PODIUM_5OVER1
-        key="construction_type",
-        format_func=lambda x: x.replace("_", " ").title()
-    )
+        const_type = st.session_state.get("construction_type", "podium_5over1")
+        const_rate = st.session_state.get("construction_rate_pct", 7.5)
+        const_ltc = st.session_state.get("construction_ltc_pct", 65.0)
+        perm_rate = st.session_state.get("perm_rate_pct", 6.5)
+        exit_cap = st.session_state.get("exit_cap_rate_pct", 5.5)
 
-    st.sidebar.subheader("Project Size")
-    st.sidebar.slider(
-        "Total Units",
-        min_value=50, max_value=500, value=200, step=10,
-        key="target_units",
-        help="Total number of units in the development"
-    )
+        st.sidebar.markdown(f"{const_type.replace('_', ' ').title()}")
+        st.sidebar.markdown(f"Const: {const_rate:.1f}% @ {const_ltc:.0f}% LTC")
+        st.sidebar.markdown(f"Perm: {perm_rate:.1f}% | Exit: {exit_cap:.1f}%")
 
-    st.sidebar.slider(
-        "Affordable %",
-        min_value=0.0, max_value=50.0, value=20.0, step=5.0,
-        key="affordable_pct",
-        format="%.0f%%",
-        help="Percentage of units designated as affordable"
-    )
+        # Incentive tier (comparison mode)
+        if is_comparison:
+            selected_tier = st.session_state.get("selected_tier", 2)
+            tier_names = {1: "Tier 1", 2: "Tier 2", 3: "Tier 3"}
+            active = []
+            if st.session_state.get("tif_lump_sum", True):
+                active.append("TIF")
+            if st.session_state.get("smart_fee_waiver", True):
+                active.append("SMART")
+            incentive_str = " + ".join(active) if active else "None"
+            st.sidebar.markdown(f"{tier_names.get(selected_tier, 'Tier 2')} | {incentive_str}")
 
-    st.sidebar.subheader("Incentive Tier")
-    st.sidebar.radio(
-        "Select Tier",
-        options=[1, 2, 3],
-        index=1,  # Tier 2
-        key="selected_tier",
-        format_func=lambda x: {
-            1: "Tier 1: 5% @ 30% AMI",
-            2: "Tier 2: 20% @ 50% AMI",
-            3: "Tier 3: 10% @ 50% AMI",
-        }[x]
-    )
-
-    st.sidebar.subheader("Incentives")
-    st.sidebar.checkbox("SMART Fee Waiver", value=True, key="smart_fee_waiver")
-    st.sidebar.checkbox("TIF Stream", value=True, key="tif_stream")
-    st.sidebar.checkbox("TIF Lump Sum", value=False, key="tif_lump_sum")
-    st.sidebar.checkbox("Tax Abatement", value=False, key="tax_abatement")
-    st.sidebar.checkbox("Interest Buydown", value=False, key="interest_buydown")
+    except Exception as e:
+        st.sidebar.info("Configure project to see summary")
+        import traceback
+        st.sidebar.caption(f"Error: {e}")
 
 
 def render_scenarios_tab():
@@ -483,67 +609,367 @@ def render_scenarios_tab():
             render_scenario_summary(scenario_b)
 
 
-def render_project_inputs_tab():
-    """Render the project inputs tab."""
+def render_inputs_form(prefix: str = "", is_mixed_income: bool = False):
+    """Render the project inputs form.
+
+    Args:
+        prefix: Key prefix for session state (empty for market rate, "mixed_" for mixed income)
+        is_mixed_income: If True, show affordable rent growth input
+    """
+    # Helper to get key with prefix
+    def key(name: str) -> str:
+        return f"{prefix}{name}" if prefix else name
+
+    # Initialize session state for all keys before rendering widgets
+    # This avoids the "default value but also set via Session State API" error
+    defaults = {
+        "predevelopment_months": 18,
+        "construction_months": 24,
+        "leaseup_months": 12,
+        "operations_months": 60,
+        "land_cost_per_acre": 1_000_000,
+        "hard_cost_per_unit": 155_000,
+        "soft_cost_pct": 30.0,
+        "vacancy_rate_pct": 6.0,
+        "leaseup_pace_pct": 8.0,
+        "opex_utilities": 1_200,
+        "opex_maintenance": 1_500,
+        "opex_management_pct": 5.0,
+        "market_rent_growth_pct": 2.0,
+        "affordable_rent_growth_pct": 1.0,
+        "opex_growth_pct": 3.0,
+        "property_tax_growth_pct": 2.0,
+        "construction_rate_pct": 7.5,
+        "construction_ltc_pct": 65.0,
+        "perm_rate_pct": 6.0,
+        "perm_amort_years": 20,
+        "perm_ltv_max_pct": 65.0,
+        "perm_dscr_min": 1.25,
+        "exit_cap_rate_pct": 5.5,
+        "existing_assessed_value": 5_000_000,
+    }
+
+    for name, default in defaults.items():
+        k = key(name)
+        if k not in st.session_state:
+            # For mixed income, inherit from market rate if available
+            if prefix:
+                st.session_state[k] = st.session_state.get(name, default)
+            else:
+                st.session_state[k] = default
+
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.subheader("Timing")
-        st.number_input("Predevelopment (months)", 6, 36, 18, key="predevelopment_months")
-        st.number_input("Construction (months)", 12, 48, 24, key="construction_months")
-        st.number_input("Lease-up (months)", 6, 24, 12, key="leaseup_months")
-        st.number_input("Operations (months)", 12, 120, 60, key="operations_months")
+        st.number_input("Predevelopment (months)", min_value=6, max_value=36,
+                       value=st.session_state[key("predevelopment_months")],
+                       key=key("predevelopment_months"))
+        st.number_input("Construction (months)", min_value=12, max_value=48,
+                       value=st.session_state[key("construction_months")],
+                       key=key("construction_months"))
+        st.number_input("Lease-up (months)", min_value=6, max_value=24,
+                       value=st.session_state[key("leaseup_months")],
+                       key=key("leaseup_months"))
+        st.number_input("Operations (months)", min_value=12, max_value=120,
+                       value=st.session_state[key("operations_months")],
+                       key=key("operations_months"))
 
         st.subheader("Land & Construction")
-        currency_input("Land Cost/Acre", "land_cost_per_acre", 1_000_000, 100_000, 10_000_000)
-        currency_input("Hard Cost/Unit", "hard_cost_per_unit", 155_000, 100_000, 500_000)
-        st.slider("Soft Cost % (of hard costs)", 0.0, 60.0, 30.0, 1.0, key="soft_cost_pct",
-                 format="%.0f%%", help="As percentage of hard costs")
+        currency_input("Land Cost/Acre", key("land_cost_per_acre"),
+                      st.session_state[key("land_cost_per_acre")], 100_000, 10_000_000)
+        currency_input("Hard Cost/Unit", key("hard_cost_per_unit"),
+                      st.session_state[key("hard_cost_per_unit")], 100_000, 500_000)
+        st.slider("Soft Cost % (of hard costs)", min_value=0.0, max_value=60.0, step=1.0,
+                 key=key("soft_cost_pct"), format="%.0f%%",
+                 help="As percentage of hard costs")
 
     with col2:
         st.subheader("Operations")
-        st.slider("Vacancy Rate", 0.0, 30.0, 6.0, 1.0, key="vacancy_rate_pct", format="%.0f%%")
-        st.slider("Lease-up Pace (monthly)", 0.0, 20.0, 8.0, 1.0, key="leaseup_pace_pct",
-                 format="%.0f%%", help="Monthly absorption during lease-up")
+        st.slider("Vacancy Rate", min_value=0.0, max_value=30.0, step=1.0,
+                 key=key("vacancy_rate_pct"), format="%.0f%%")
+        st.slider("Lease-up Pace (monthly)", min_value=0.0, max_value=20.0, step=1.0,
+                 key=key("leaseup_pace_pct"), format="%.0f%%",
+                 help="Monthly absorption during lease-up")
 
         st.subheader("Operating Expenses")
-        currency_input("Utilities ($/unit/yr)", "opex_utilities", 1_200, 500, 5_000)
-        currency_input("Maintenance ($/unit/yr)", "opex_maintenance", 1_500, 500, 5_000)
-        st.slider("Management Fee % (of EGI)", 0.0, 8.0, 5.0, 0.5, key="opex_management_pct",
-                 format="%.1f%%")
+        currency_input("Utilities ($/unit/yr)", key("opex_utilities"),
+                      st.session_state[key("opex_utilities")], 500, 5_000)
+        currency_input("Maintenance ($/unit/yr)", key("opex_maintenance"),
+                      st.session_state[key("opex_maintenance")], 500, 5_000)
+        st.slider("Management Fee % (of EGI)", min_value=0.0, max_value=8.0, step=0.5,
+                 key=key("opex_management_pct"), format="%.1f%%")
 
         st.subheader("Annual Escalations")
-        st.slider("Market Rent Growth", 0.0, 5.0, 2.0, 0.5, key="market_rent_growth_pct",
-                 format="%.1f%%", help="Annual growth rate for market rents")
-        st.slider("Affordable Rent Growth", 0.0, 3.0, 1.0, 0.5, key="affordable_rent_growth_pct",
-                 format="%.1f%%", help="Annual growth rate for affordable rents")
-        st.slider("OpEx Growth", 0.0, 5.0, 3.0, 0.5, key="opex_growth_pct",
-                 format="%.1f%%", help="Annual growth rate for operating expenses")
-        st.slider("Property Tax Growth", 0.0, 5.0, 2.0, 0.5, key="property_tax_growth_pct",
-                 format="%.1f%%", help="Annual growth rate for property taxes")
+        st.slider("Market Rent Growth", min_value=0.0, max_value=5.0, step=0.5,
+                 key=key("market_rent_growth_pct"), format="%.1f%%",
+                 help="Annual growth rate for market rents")
+        if is_mixed_income:
+            st.slider("Affordable Rent Growth", min_value=0.0, max_value=3.0, step=0.5,
+                     key=key("affordable_rent_growth_pct"), format="%.1f%%",
+                     help="Annual growth rate for affordable rents")
+        st.slider("OpEx Growth", min_value=0.0, max_value=5.0, step=0.5,
+                 key=key("opex_growth_pct"), format="%.1f%%",
+                 help="Annual growth rate for operating expenses")
+        st.slider("Property Tax Growth", min_value=0.0, max_value=5.0, step=0.5,
+                 key=key("property_tax_growth_pct"), format="%.1f%%",
+                 help="Annual growth rate for property taxes")
 
     with col3:
         st.subheader("Financing")
-        st.slider("Construction Rate", 0.0, 15.0, 7.5, 0.5, key="construction_rate_pct",
-                 format="%.1f%%")
-        st.slider("Construction LTC", 0.0, 90.0, 65.0, 5.0, key="construction_ltc_pct",
-                 format="%.0f%%")
-        st.slider("Perm Rate", 0.0, 18.0, 6.0, 0.5, key="perm_rate_pct",
-                 format="%.1f%%")
-        st.selectbox("Perm Amortization", [15, 20, 25, 30], index=1,
-                    key="perm_amort_years", format_func=lambda x: f"{x} years")
-        st.slider("Max LTV", 0.0, 90.0, 65.0, 5.0, key="perm_ltv_max_pct",
-                 format="%.0f%%")
-        st.slider("Min DSCR", 1.00, 1.50, 1.25, 0.05,
-                 key="perm_dscr_min")
+        st.slider("Construction Rate", min_value=0.0, max_value=15.0, step=0.5,
+                 key=key("construction_rate_pct"), format="%.1f%%")
+        st.slider("Construction LTC", min_value=0.0, max_value=90.0, step=5.0,
+                 key=key("construction_ltc_pct"), format="%.0f%%")
+        st.slider("Perm Rate", min_value=0.0, max_value=18.0, step=0.5,
+                 key=key("perm_rate_pct"), format="%.1f%%")
+        amort_options = [15, 20, 25, 30]
+        amort_value = st.session_state[key("perm_amort_years")]
+        amort_index = amort_options.index(amort_value) if amort_value in amort_options else 1
+        st.selectbox("Perm Amortization", amort_options,
+                    index=amort_index,
+                    key=key("perm_amort_years"), format_func=lambda x: f"{x} years")
+        st.slider("Max LTV", min_value=0.0, max_value=90.0, step=5.0,
+                 key=key("perm_ltv_max_pct"), format="%.0f%%")
+        st.slider("Min DSCR", min_value=1.00, max_value=1.50, step=0.05,
+                 key=key("perm_dscr_min"))
 
         st.subheader("Exit")
-        st.slider("Exit Cap Rate", 3.0, 15.0, 5.5, 0.5, key="exit_cap_rate_pct",
-                 format="%.1f%%")
+        st.slider("Exit Cap Rate", min_value=3.0, max_value=15.0, step=0.5,
+                 key=key("exit_cap_rate_pct"), format="%.1f%%")
 
         st.subheader("Property Tax")
-        currency_input("Existing Assessed Value", "existing_assessed_value", 5_000_000, 0, 50_000_000,
+        currency_input("Existing Assessed Value", key("existing_assessed_value"),
+                      st.session_state[key("existing_assessed_value")], 0, 50_000_000,
                       help="Pre-development assessed value of the land (baseline for TIF)")
+
+
+def render_tier_and_incentives():
+    """Render tier selection and incentive toggles for mixed-income scenarios."""
+    from src.models.incentives import IncentiveTier, TIER_REQUIREMENTS
+
+    st.subheader("Affordability Tier & Incentives")
+
+    # Tier defaults
+    tier_defaults = {
+        1: {"affordable_pct": 5, "ami_level": "30%", "name": "Tier 1 - Deep Affordability (5% @ 30% AMI)"},
+        2: {"affordable_pct": 20, "ami_level": "50%", "name": "Tier 2 - Moderate Volume (20% @ 50% AMI)"},
+        3: {"affordable_pct": 10, "ami_level": "50%", "name": "Tier 3 - Balanced (10% @ 50% AMI)"},
+    }
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        # Tier Selection
+        selected_tier = st.radio(
+            "Select Incentive Tier",
+            options=[1, 2, 3],
+            index=st.session_state.get("selected_tier", 2) - 1,
+            format_func=lambda x: tier_defaults[x]["name"],
+            key="selected_tier_radio",
+            help="Each tier has different affordability requirements and incentive levels"
+        )
+        # Sync to session state
+        st.session_state["selected_tier"] = selected_tier
+
+        # Get tier defaults
+        tier_info = tier_defaults[selected_tier]
+
+        # Affordable % (editable)
+        affordable_pct = st.number_input(
+            "Affordable Units (%)",
+            min_value=0,
+            max_value=50,
+            value=st.session_state.get(f"tier{selected_tier}_affordable_pct", tier_info["affordable_pct"]),
+            step=5,
+            key=f"tier{selected_tier}_affordable_pct_input",
+            help="Percentage of units set aside as affordable"
+        )
+        st.session_state["affordable_pct"] = float(affordable_pct)
+
+        # AMI Level
+        ami_options = ["30%", "50%", "60%", "80%"]
+        default_ami_idx = ami_options.index(tier_info["ami_level"]) if tier_info["ami_level"] in ami_options else 1
+        ami_level = st.selectbox(
+            "AMI Level",
+            options=ami_options,
+            index=default_ami_idx,
+            key=f"tier{selected_tier}_ami_input",
+            help="Area Median Income level for affordable units"
+        )
+        st.session_state["ami_level"] = ami_level
+
+        # Show unit breakdown
+        total_units = st.session_state.get("target_units", 200)
+        affordable_units = int(total_units * affordable_pct / 100)
+        market_units = total_units - affordable_units
+        st.caption(f"**{affordable_units} affordable** / {market_units} market rate units")
+
+    with col2:
+        # Incentive Toggles
+        st.markdown("**Available Incentives**")
+
+        tif_lump_sum = st.checkbox(
+            "TIF Lump Sum (Upfront Capital)",
+            value=st.session_state.get("tif_lump_sum", True),
+            key="tif_lump_sum_toggle",
+            help="Receive TIF as upfront capital contribution"
+        )
+        st.session_state["tif_lump_sum"] = tif_lump_sum
+
+        tif_stream = st.checkbox(
+            "TIF Stream (Annual Payments)",
+            value=st.session_state.get("tif_stream", False),
+            key="tif_stream_toggle",
+            help="Receive annual TIF reimbursement payments"
+        )
+        st.session_state["tif_stream"] = tif_stream
+
+        # TIF options are mutually exclusive
+        if tif_lump_sum and tif_stream:
+            st.warning("TIF Lump Sum and TIF Stream are mutually exclusive. Select one.")
+
+        smart_fee_waiver = st.checkbox(
+            "SMART Fee Waiver",
+            value=st.session_state.get("smart_fee_waiver", True),
+            key="smart_fee_waiver_toggle",
+            help="Waives development fees for affordable units"
+        )
+        st.session_state["smart_fee_waiver"] = smart_fee_waiver
+
+        tax_abatement = st.checkbox(
+            "Tax Abatement",
+            value=st.session_state.get("tax_abatement", False),
+            key="tax_abatement_toggle",
+            help="Property tax abatement (mutually exclusive with TIF)"
+        )
+        st.session_state["tax_abatement"] = tax_abatement
+
+        # TIF and abatement are mutually exclusive
+        if tax_abatement and (tif_lump_sum or tif_stream):
+            st.warning("Tax Abatement and TIF are mutually exclusive. Select one or the other.")
+
+        # Show calculated TIF value if lump sum selected
+        if tif_lump_sum:
+            calculated_tif = st.session_state.get("calculated_tif_lump_sum", 0)
+            if calculated_tif > 0:
+                st.info(f"Calculated TIF Lump Sum: **${calculated_tif:,.0f}**")
+            else:
+                st.caption("TIF value calculated on Property Tax tab")
+
+
+def render_project_inputs_tab():
+    """Render the project inputs tab with mode selection at top."""
+
+    # ========== PROJECT SETUP SECTION ==========
+    st.header("Project Setup")
+
+    col1, col2, col3 = st.columns([2, 2, 2])
+
+    with col1:
+        # Analysis Mode
+        mode = st.radio(
+            "Analysis Mode",
+            options=[ModelMode.SINGLE_PROJECT, ModelMode.COMPARISON],
+            format_func=lambda x: {
+                ModelMode.SINGLE_PROJECT: "Single Project",
+                ModelMode.COMPARISON: "Comparison",
+            }[x],
+            key="model_mode",
+            horizontal=True,
+            help="Single: Analyze one scenario. Comparison: Market vs Mixed-Income side-by-side."
+        )
+
+    with col2:
+        # Construction Type
+        st.selectbox(
+            "Construction Type",
+            options=[ct.value for ct in ConstructionType],
+            index=2,  # PODIUM_5OVER1
+            key="construction_type",
+            format_func=lambda x: x.replace("_", " ").title()
+        )
+
+    with col3:
+        # Total Units
+        st.number_input(
+            "Total Units",
+            min_value=50, max_value=500, value=200, step=10,
+            key="target_units",
+            help="Total number of units in the development"
+        )
+
+    st.divider()
+
+    # ========== PROJECT INPUTS SECTION ==========
+    st.header("Project Inputs")
+
+    # Check mode for input display
+    is_comparison = mode == ModelMode.COMPARISON
+    is_single_mixed = (mode == ModelMode.SINGLE_PROJECT and
+                       st.session_state.get("single_project_type") == ProjectType.MIXED_INCOME)
+
+    if is_comparison:
+        # Show sub-tabs for Market Rate and Mixed Income
+        input_tab1, input_tab2 = st.tabs(["Market Rate Inputs", "Mixed Income Inputs"])
+
+        with input_tab1:
+            st.caption("Inputs for the market rate scenario.")
+            render_inputs_form(prefix="", is_mixed_income=False)
+
+        with input_tab2:
+            st.caption("Inputs for the mixed income scenario. Values default to market rate on first load.")
+            # Render tier selection and incentives first
+            render_tier_and_incentives()
+            st.divider()
+            # Initialize mixed income values from market rate if not set
+            _initialize_mixed_income_inputs()
+            render_inputs_form(prefix="mixed_", is_mixed_income=True)
+
+    elif is_single_mixed:
+        # Single project mixed income - show sub-tabs
+        input_tab1, input_tab2 = st.tabs(["Market Rate Inputs", "Mixed Income Inputs"])
+
+        with input_tab1:
+            st.caption("Base market rate inputs (for comparison reference).")
+            render_inputs_form(prefix="", is_mixed_income=False)
+
+        with input_tab2:
+            st.caption("Inputs for your mixed income project.")
+            # Render tier selection and incentives first
+            render_tier_and_incentives()
+            st.divider()
+            _initialize_mixed_income_inputs()
+            render_inputs_form(prefix="mixed_", is_mixed_income=True)
+
+    else:
+        # Single project market rate - just show one form
+        st.caption("Project inputs for market rate scenario.")
+        render_inputs_form(prefix="", is_mixed_income=False)
+
+
+def _initialize_mixed_income_inputs():
+    """Initialize mixed income inputs from market rate values if not already set."""
+    # List of keys to copy from market rate to mixed income
+    keys_to_copy = [
+        "predevelopment_months", "construction_months", "leaseup_months", "operations_months",
+        "land_cost_per_acre", "hard_cost_per_unit", "soft_cost_pct",
+        "vacancy_rate_pct", "leaseup_pace_pct",
+        "opex_utilities", "opex_maintenance", "opex_management_pct",
+        "market_rent_growth_pct", "opex_growth_pct", "property_tax_growth_pct",
+        "construction_rate_pct", "construction_ltc_pct",
+        "perm_rate_pct", "perm_amort_years", "perm_ltv_max_pct", "perm_dscr_min",
+        "exit_cap_rate_pct", "existing_assessed_value",
+    ]
+
+    for key in keys_to_copy:
+        mixed_key = f"mixed_{key}"
+        if mixed_key not in st.session_state and key in st.session_state:
+            st.session_state[mixed_key] = st.session_state[key]
+
+    # Set default for affordable rent growth if not present
+    if "mixed_affordable_rent_growth_pct" not in st.session_state:
+        st.session_state["mixed_affordable_rent_growth_pct"] = 1.0
 
 
 
@@ -578,7 +1004,6 @@ def render_single_project_results(metrics, result, scenario_name: str = "Project
             "Revenue & Operations",
             "",
             "",
-            "",
             "Returns",
             "",
             "",
@@ -589,11 +1014,9 @@ def render_single_project_results(metrics, result, scenario_name: str = "Project
             "Equity Required",
             "Permanent Loan",
             "TIF Value",
-            "",
             "Gross Potential Rent (Annual)",
             "Net Operating Income (Annual)",
             "Yield on Cost",
-            "",
             "Levered IRR",
             "Unlevered IRR",
             "Equity Multiple",
@@ -604,11 +1027,9 @@ def render_single_project_results(metrics, result, scenario_name: str = "Project
             f"${metrics.equity_required:,.0f}",
             f"${metrics.debt_amount:,.0f}",
             f"${metrics.tif_value:,.0f}",
-            "",
             f"${metrics.gpr_annual:,.0f}",
             f"${metrics.noi_annual:,.0f}",
             f"{metrics.yield_on_cost:.2%}",
-            "",
             f"{metrics.levered_irr:.2%}",
             f"{metrics.unlevered_irr:.2%}",
             f"{metrics.equity_multiple:.2f}x",
@@ -646,7 +1067,11 @@ def render_single_project_results(metrics, result, scenario_name: str = "Project
 
 
 def render_results_tab(market_metrics, mixed_metrics, comparison, market_result, mixed_result):
-    """Render the results comparison tab."""
+    """Render the results comparison tab with granular developer metrics."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from src.calculations.dcf import Phase
+
     # IRR Difference callout
     irr_diff = comparison.irr_difference_bps
     meets_target = comparison.meets_target
@@ -726,51 +1151,766 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
     df = pd.DataFrame(comparison_data)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Cash flow chart
-    st.subheader("Monthly Cash Flows")
+    st.divider()
 
-    import plotly.graph_objects as go
+    # ========== DEVELOPER METRICS SECTION ==========
+    st.subheader("Developer Metrics Analysis")
 
-    market_cfs = [cf.levered_cf for cf in market_result.monthly_cash_flows]
-    mixed_cfs = [cf.levered_cf for cf in mixed_result.monthly_cash_flows]
-    months = list(range(1, len(market_cfs) + 1))
+    # Helper function to calculate metrics from cash flows
+    def calc_developer_metrics(result, metrics, label):
+        """Calculate detailed developer metrics from DCF result."""
+        cfs = result.monthly_cash_flows
+        total_units = metrics.total_units if hasattr(metrics, 'total_units') else st.session_state.get("target_units", 200)
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=months, y=market_cfs,
-        mode='lines', name='Market Rate',
-        line=dict(color='#1f77b4', width=2)
-    ))
-    fig.add_trace(go.Scatter(
-        x=months, y=mixed_cfs,
-        mode='lines', name='Mixed Income',
-        line=dict(color='#ff7f0e', width=2)
-    ))
+        # Separate cash flows by phase
+        predev_cfs = [cf for cf in cfs if cf.phase == Phase.PREDEVELOPMENT]
+        construction_cfs = [cf for cf in cfs if cf.phase == Phase.CONSTRUCTION]
+        leaseup_cfs = [cf for cf in cfs if cf.phase == Phase.LEASEUP]
+        ops_cfs = [cf for cf in cfs if cf.phase == Phase.OPERATIONS]
+        reversion_cf = [cf for cf in cfs if cf.phase == Phase.REVERSION]
 
-    fig.update_layout(
-        title="Levered Cash Flows by Month",
-        xaxis_title="Month",
-        yaxis_title="Cash Flow ($)",
-        yaxis_tickformat="$,.0f",
-        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
-        height=400,
-    )
+        # Total equity invested (sum of equity contributions)
+        total_equity_invested = sum(cf.equity_contribution for cf in cfs if cf.equity_contribution > 0)
 
-    st.plotly_chart(fig, use_container_width=True)
+        # Total operating cash flows (levered)
+        total_ops_levered_cf = sum(cf.levered_cf for cf in ops_cfs + leaseup_cfs)
+
+        # Reversion proceeds
+        reversion_proceeds = reversion_cf[0].levered_cf if reversion_cf else 0
+
+        # Total returns to equity
+        total_returns = total_ops_levered_cf + reversion_proceeds
+
+        # Cash-on-cash by year (annualized operating cash flows)
+        ops_cash_by_year = {}
+        for cf in ops_cfs + leaseup_cfs:
+            year = (cf.month - 1) // 12 + 1
+            ops_cash_by_year[year] = ops_cash_by_year.get(year, 0) + cf.levered_cf
+
+        # Average annual cash-on-cash during operations
+        if ops_cash_by_year and total_equity_invested > 0:
+            avg_annual_coc = sum(ops_cash_by_year.values()) / len(ops_cash_by_year) / total_equity_invested
+        else:
+            avg_annual_coc = 0
+
+        # DSCR calculations (during operations only)
+        dscr_values = []
+        for cf in ops_cfs:
+            if cf.perm_debt_service > 0:
+                dscr = cf.noi / cf.perm_debt_service
+                dscr_values.append(dscr)
+
+        avg_dscr = sum(dscr_values) / len(dscr_values) if dscr_values else 0
+        min_dscr = min(dscr_values) if dscr_values else 0
+        max_dscr = max(dscr_values) if dscr_values else 0
+
+        # Debt metrics
+        tdc = metrics.tdc
+        debt = metrics.debt_amount
+        equity = metrics.equity_required
+        ltv = debt / (tdc * 1.0) if tdc > 0 else 0  # Debt to TDC as proxy
+        debt_to_equity = debt / equity if equity > 0 else 0
+
+        # Per unit metrics
+        equity_per_unit = equity / total_units if total_units > 0 else 0
+        debt_per_unit = debt / total_units if total_units > 0 else 0
+        noi_per_unit = metrics.noi_annual / total_units if total_units > 0 else 0
+        tdc_per_unit = tdc / total_units if total_units > 0 else 0
+
+        # IRR Bifurcation - separate operations vs reversion contribution
+        import numpy_financial as npf
+
+        # Build full levered cash flow series
+        full_levered_cfs = [cf.levered_cf for cf in cfs]
+
+        # Operations-only IRR: all cash flows except reversion
+        # Replace reversion month with 0 to isolate operations contribution
+        ops_only_cfs = full_levered_cfs.copy()
+        if reversion_cf:
+            rev_month_idx = len(cfs) - 1  # Reversion is last month
+            ops_only_cfs[rev_month_idx] = 0
+
+        try:
+            ops_monthly_irr = npf.irr(ops_only_cfs)
+            ops_only_irr = (1 + ops_monthly_irr) ** 12 - 1 if ops_monthly_irr and not np.isnan(ops_monthly_irr) else 0
+        except:
+            ops_only_irr = 0
+
+        # Reversion-only IRR: equity contributions + reversion only (no operating cash flows)
+        # Zero out all operating period positive cash flows
+        rev_only_cfs = []
+        for i, cf in enumerate(cfs):
+            if cf.phase in [Phase.PREDEVELOPMENT, Phase.CONSTRUCTION]:
+                # Keep equity contributions (negative cash flows during development)
+                rev_only_cfs.append(cf.levered_cf)
+            elif cf.phase == Phase.REVERSION:
+                # Keep reversion
+                rev_only_cfs.append(cf.levered_cf)
+            else:
+                # Zero out lease-up and operations
+                rev_only_cfs.append(0)
+
+        try:
+            rev_monthly_irr = npf.irr(rev_only_cfs)
+            rev_only_irr = (1 + rev_monthly_irr) ** 12 - 1 if rev_monthly_irr and not np.isnan(rev_monthly_irr) else 0
+        except:
+            rev_only_irr = 0
+
+        # Total profit breakdown
+        total_profit = total_returns - total_equity_invested
+        ops_profit = total_ops_levered_cf
+        rev_profit = reversion_proceeds - total_equity_invested  # Reversion minus equity return
+
+        # Profit attribution percentages
+        if total_profit > 0:
+            ops_profit_pct = ops_profit / total_profit * 100
+            rev_profit_pct = (total_profit - ops_profit) / total_profit * 100
+        else:
+            ops_profit_pct = 0
+            rev_profit_pct = 0
+
+        return {
+            "label": label,
+            "total_units": total_units,
+            "total_equity_invested": total_equity_invested,
+            "total_ops_levered_cf": total_ops_levered_cf,
+            "reversion_proceeds": reversion_proceeds,
+            "total_returns": total_returns,
+            "avg_annual_coc": avg_annual_coc,
+            "avg_dscr": avg_dscr,
+            "min_dscr": min_dscr,
+            "max_dscr": max_dscr,
+            "ltv": ltv,
+            "debt_to_equity": debt_to_equity,
+            "equity_per_unit": equity_per_unit,
+            "debt_per_unit": debt_per_unit,
+            "noi_per_unit": noi_per_unit,
+            "tdc_per_unit": tdc_per_unit,
+            "tdc": tdc,
+            "debt": debt,
+            "equity": equity,
+            "ops_cash_by_year": ops_cash_by_year,
+            "ops_cfs": ops_cfs,
+            "leaseup_cfs": leaseup_cfs,
+            "reversion_cf": reversion_cf,
+            "all_cfs": cfs,
+            # IRR bifurcation
+            "ops_only_irr": ops_only_irr,
+            "rev_only_irr": rev_only_irr,
+            "total_profit": total_profit,
+            "ops_profit": ops_profit,
+            "ops_profit_pct": ops_profit_pct,
+            "rev_profit_pct": rev_profit_pct,
+        }
+
+    market_dev = calc_developer_metrics(market_result, market_metrics, "Market Rate")
+    mixed_dev = calc_developer_metrics(mixed_result, mixed_metrics, "Mixed Income")
+
+    # Create tabs for different metric views
+    metrics_tab1, metrics_tab2, metrics_tab3, metrics_tab4 = st.tabs([
+        "Returns to Equity", "Debt & Coverage", "Per Unit Analysis", "Cash Flow Charts"
+    ])
+
+    with metrics_tab1:
+        st.markdown("#### Returns to Equity")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Market Rate**")
+            st.metric("Total Equity Invested", f"${market_dev['total_equity_invested']:,.0f}")
+            st.metric("Operating Period Returns", f"${market_dev['total_ops_levered_cf']:,.0f}")
+            st.metric("Reversion Proceeds", f"${market_dev['reversion_proceeds']:,.0f}")
+            st.metric("Total Returns to Equity", f"${market_dev['total_returns']:,.0f}")
+            st.metric("Equity Multiple", f"{market_metrics.equity_multiple:.2f}x")
+            st.metric("Avg Annual Cash-on-Cash", f"{market_dev['avg_annual_coc']:.1%}")
+
+        with col2:
+            st.markdown("**Mixed Income**")
+            equity_diff = mixed_dev['total_equity_invested'] - market_dev['total_equity_invested']
+            st.metric("Total Equity Invested", f"${mixed_dev['total_equity_invested']:,.0f}",
+                     delta=f"${equity_diff:+,.0f}", delta_color="inverse")
+
+            ops_diff = mixed_dev['total_ops_levered_cf'] - market_dev['total_ops_levered_cf']
+            st.metric("Operating Period Returns", f"${mixed_dev['total_ops_levered_cf']:,.0f}",
+                     delta=f"${ops_diff:+,.0f}")
+
+            rev_diff = mixed_dev['reversion_proceeds'] - market_dev['reversion_proceeds']
+            st.metric("Reversion Proceeds", f"${mixed_dev['reversion_proceeds']:,.0f}",
+                     delta=f"${rev_diff:+,.0f}")
+
+            total_diff = mixed_dev['total_returns'] - market_dev['total_returns']
+            st.metric("Total Returns to Equity", f"${mixed_dev['total_returns']:,.0f}",
+                     delta=f"${total_diff:+,.0f}")
+
+            mult_diff = mixed_metrics.equity_multiple - market_metrics.equity_multiple
+            st.metric("Equity Multiple", f"{mixed_metrics.equity_multiple:.2f}x",
+                     delta=f"{mult_diff:+.2f}x")
+
+            coc_diff = mixed_dev['avg_annual_coc'] - market_dev['avg_annual_coc']
+            st.metric("Avg Annual Cash-on-Cash", f"{mixed_dev['avg_annual_coc']:.1%}",
+                     delta=f"{coc_diff:+.1%}")
+
+        # Profit distribution visualization
+        st.markdown("#### Profit Distribution")
+
+        fig_profit = go.Figure()
+
+        categories = ['Operating Returns', 'Reversion Proceeds']
+        market_values = [market_dev['total_ops_levered_cf'], market_dev['reversion_proceeds']]
+        mixed_values = [mixed_dev['total_ops_levered_cf'], mixed_dev['reversion_proceeds']]
+
+        fig_profit.add_trace(go.Bar(
+            name='Market Rate',
+            x=categories,
+            y=market_values,
+            marker_color='#1f77b4'
+        ))
+        fig_profit.add_trace(go.Bar(
+            name='Mixed Income',
+            x=categories,
+            y=mixed_values,
+            marker_color='#ff7f0e'
+        ))
+
+        fig_profit.update_layout(
+            barmode='group',
+            yaxis_tickformat="$,.0f",
+            height=350,
+            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+        )
+
+        st.plotly_chart(fig_profit, use_container_width=True)
+
+        # IRR Bifurcation Section
+        st.markdown("#### IRR Bifurcation: Operations vs Reversion")
+        st.caption("Shows how much of the total IRR is driven by operating cash flows vs exit proceeds")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Market Rate**")
+            st.metric("Total Levered IRR", f"{market_metrics.levered_irr:.2%}")
+            st.metric("Operations-Only IRR", f"{market_dev['ops_only_irr']:.2%}",
+                     help="IRR if the project had no exit/reversion")
+            st.metric("Reversion-Only IRR", f"{market_dev['rev_only_irr']:.2%}",
+                     help="IRR if there were no operating cash flows")
+            st.divider()
+            st.metric("Profit from Operations", f"{market_dev['ops_profit_pct']:.1f}%",
+                     help="% of total profit attributable to operating cash flows")
+            st.metric("Profit from Reversion", f"{market_dev['rev_profit_pct']:.1f}%",
+                     help="% of total profit attributable to exit proceeds")
+
+        with col2:
+            st.markdown("**Mixed Income**")
+            irr_diff = (mixed_metrics.levered_irr - market_metrics.levered_irr) * 10000
+            st.metric("Total Levered IRR", f"{mixed_metrics.levered_irr:.2%}",
+                     delta=f"{irr_diff:+.0f} bps")
+
+            ops_irr_diff = (mixed_dev['ops_only_irr'] - market_dev['ops_only_irr']) * 10000
+            st.metric("Operations-Only IRR", f"{mixed_dev['ops_only_irr']:.2%}",
+                     delta=f"{ops_irr_diff:+.0f} bps",
+                     help="IRR if the project had no exit/reversion")
+
+            rev_irr_diff = (mixed_dev['rev_only_irr'] - market_dev['rev_only_irr']) * 10000
+            st.metric("Reversion-Only IRR", f"{mixed_dev['rev_only_irr']:.2%}",
+                     delta=f"{rev_irr_diff:+.0f} bps",
+                     help="IRR if there were no operating cash flows")
+
+            st.divider()
+
+            ops_pct_diff = mixed_dev['ops_profit_pct'] - market_dev['ops_profit_pct']
+            st.metric("Profit from Operations", f"{mixed_dev['ops_profit_pct']:.1f}%",
+                     delta=f"{ops_pct_diff:+.1f}%", delta_color="off",
+                     help="% of total profit attributable to operating cash flows")
+
+            rev_pct_diff = mixed_dev['rev_profit_pct'] - market_dev['rev_profit_pct']
+            st.metric("Profit from Reversion", f"{mixed_dev['rev_profit_pct']:.1f}%",
+                     delta=f"{rev_pct_diff:+.1f}%", delta_color="off",
+                     help="% of total profit attributable to exit proceeds")
+
+        # IRR Bifurcation visualization
+        st.markdown("#### IRR Breakdown Comparison")
+
+        fig_irr = go.Figure()
+
+        irr_categories = ['Operations-Only IRR', 'Reversion-Only IRR', 'Total IRR']
+        market_irrs = [market_dev['ops_only_irr'] * 100, market_dev['rev_only_irr'] * 100,
+                       market_metrics.levered_irr * 100]
+        mixed_irrs = [mixed_dev['ops_only_irr'] * 100, mixed_dev['rev_only_irr'] * 100,
+                      mixed_metrics.levered_irr * 100]
+
+        fig_irr.add_trace(go.Bar(
+            name='Market Rate',
+            x=irr_categories,
+            y=market_irrs,
+            marker_color='#1f77b4',
+            text=[f"{v:.1f}%" for v in market_irrs],
+            textposition='outside'
+        ))
+        fig_irr.add_trace(go.Bar(
+            name='Mixed Income',
+            x=irr_categories,
+            y=mixed_irrs,
+            marker_color='#ff7f0e',
+            text=[f"{v:.1f}%" for v in mixed_irrs],
+            textposition='outside'
+        ))
+
+        fig_irr.update_layout(
+            barmode='group',
+            yaxis_title="IRR (%)",
+            yaxis_ticksuffix="%",
+            height=400,
+            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+        )
+
+        st.plotly_chart(fig_irr, use_container_width=True)
+
+        # Deal character assessment
+        st.markdown("#### Deal Character Assessment")
+
+        def assess_deal_character(ops_pct, rev_pct):
+            """Determine if deal is yield-driven or appreciation-driven."""
+            if ops_pct >= 60:
+                return "Yield Play", "Returns primarily driven by operating cash flows"
+            elif rev_pct >= 60:
+                return "Appreciation Play", "Returns primarily driven by exit/sale proceeds"
+            else:
+                return "Balanced", "Returns split between operations and exit"
+
+        market_char, market_desc = assess_deal_character(market_dev['ops_profit_pct'], market_dev['rev_profit_pct'])
+        mixed_char, mixed_desc = assess_deal_character(mixed_dev['ops_profit_pct'], mixed_dev['rev_profit_pct'])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"**Market Rate: {market_char}**\n\n{market_desc}")
+        with col2:
+            st.info(f"**Mixed Income: {mixed_char}**\n\n{mixed_desc}")
+
+    with metrics_tab2:
+        st.markdown("#### Debt Dependence & Coverage")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Market Rate**")
+            st.metric("Debt Amount", f"${market_dev['debt']:,.0f}")
+            st.metric("Debt-to-TDC", f"{(market_dev['debt']/market_dev['tdc']*100):.1f}%")
+            st.metric("Debt-to-Equity", f"{market_dev['debt_to_equity']:.2f}x")
+            st.divider()
+            st.metric("Avg DSCR (Operations)", f"{market_dev['avg_dscr']:.2f}x")
+            st.metric("Min DSCR", f"{market_dev['min_dscr']:.2f}x")
+            st.metric("Max DSCR", f"{market_dev['max_dscr']:.2f}x")
+
+        with col2:
+            st.markdown("**Mixed Income**")
+            debt_diff = mixed_dev['debt'] - market_dev['debt']
+            st.metric("Debt Amount", f"${mixed_dev['debt']:,.0f}",
+                     delta=f"${debt_diff:+,.0f}", delta_color="inverse")
+
+            d2tdc_market = market_dev['debt']/market_dev['tdc']*100
+            d2tdc_mixed = mixed_dev['debt']/mixed_dev['tdc']*100
+            st.metric("Debt-to-TDC", f"{d2tdc_mixed:.1f}%",
+                     delta=f"{d2tdc_mixed - d2tdc_market:+.1f}%", delta_color="inverse")
+
+            dte_diff = mixed_dev['debt_to_equity'] - market_dev['debt_to_equity']
+            st.metric("Debt-to-Equity", f"{mixed_dev['debt_to_equity']:.2f}x",
+                     delta=f"{dte_diff:+.2f}x", delta_color="inverse")
+
+            st.divider()
+
+            dscr_diff = mixed_dev['avg_dscr'] - market_dev['avg_dscr']
+            st.metric("Avg DSCR (Operations)", f"{mixed_dev['avg_dscr']:.2f}x",
+                     delta=f"{dscr_diff:+.2f}x")
+
+            min_dscr_diff = mixed_dev['min_dscr'] - market_dev['min_dscr']
+            st.metric("Min DSCR", f"{mixed_dev['min_dscr']:.2f}x",
+                     delta=f"{min_dscr_diff:+.2f}x")
+
+            max_dscr_diff = mixed_dev['max_dscr'] - market_dev['max_dscr']
+            st.metric("Max DSCR", f"{mixed_dev['max_dscr']:.2f}x",
+                     delta=f"{max_dscr_diff:+.2f}x")
+
+        # Capital stack comparison
+        st.markdown("#### Capital Stack Comparison")
+
+        fig_stack = make_subplots(rows=1, cols=2, specs=[[{'type':'pie'}, {'type':'pie'}]],
+                                  subplot_titles=['Market Rate', 'Mixed Income'])
+
+        # Market Rate capital stack
+        market_tif = market_metrics.tif_value
+        fig_stack.add_trace(go.Pie(
+            labels=['Equity', 'Debt', 'TIF'],
+            values=[market_dev['equity'], market_dev['debt'], market_tif],
+            marker_colors=['#2ecc71', '#e74c3c', '#3498db'],
+            textinfo='label+percent',
+            textposition='inside',
+            hole=0.3
+        ), row=1, col=1)
+
+        # Mixed Income capital stack
+        mixed_tif = mixed_metrics.tif_value
+        fig_stack.add_trace(go.Pie(
+            labels=['Equity', 'Debt', 'TIF'],
+            values=[mixed_dev['equity'], mixed_dev['debt'], mixed_tif],
+            marker_colors=['#2ecc71', '#e74c3c', '#3498db'],
+            textinfo='label+percent',
+            textposition='inside',
+            hole=0.3
+        ), row=1, col=2)
+
+        fig_stack.update_layout(height=350, showlegend=False)
+        st.plotly_chart(fig_stack, use_container_width=True)
+
+    with metrics_tab3:
+        st.markdown("#### Per Unit Analysis")
+
+        total_units = market_dev['total_units']
+
+        per_unit_data = {
+            "Metric": [
+                "TDC per Unit",
+                "Equity per Unit",
+                "Debt per Unit",
+                "Annual NOI per Unit",
+                "Annual GPR per Unit",
+            ],
+            "Market Rate": [
+                f"${market_dev['tdc_per_unit']:,.0f}",
+                f"${market_dev['equity_per_unit']:,.0f}",
+                f"${market_dev['debt_per_unit']:,.0f}",
+                f"${market_dev['noi_per_unit']:,.0f}",
+                f"${market_metrics.gpr_annual / total_units:,.0f}",
+            ],
+            "Mixed Income": [
+                f"${mixed_dev['tdc_per_unit']:,.0f}",
+                f"${mixed_dev['equity_per_unit']:,.0f}",
+                f"${mixed_dev['debt_per_unit']:,.0f}",
+                f"${mixed_dev['noi_per_unit']:,.0f}",
+                f"${mixed_metrics.gpr_annual / total_units:,.0f}",
+            ],
+            "Difference": [
+                f"${mixed_dev['tdc_per_unit'] - market_dev['tdc_per_unit']:+,.0f}",
+                f"${mixed_dev['equity_per_unit'] - market_dev['equity_per_unit']:+,.0f}",
+                f"${mixed_dev['debt_per_unit'] - market_dev['debt_per_unit']:+,.0f}",
+                f"${mixed_dev['noi_per_unit'] - market_dev['noi_per_unit']:+,.0f}",
+                f"${(mixed_metrics.gpr_annual - market_metrics.gpr_annual) / total_units:+,.0f}",
+            ],
+        }
+
+        df_per_unit = pd.DataFrame(per_unit_data)
+        st.dataframe(df_per_unit, use_container_width=True, hide_index=True)
+
+        # Per unit bar chart
+        st.markdown("#### Per Unit Comparison")
+
+        metrics_names = ['TDC', 'Equity', 'Debt', 'Annual NOI']
+        market_per_unit = [market_dev['tdc_per_unit'], market_dev['equity_per_unit'],
+                          market_dev['debt_per_unit'], market_dev['noi_per_unit']]
+        mixed_per_unit = [mixed_dev['tdc_per_unit'], mixed_dev['equity_per_unit'],
+                         mixed_dev['debt_per_unit'], mixed_dev['noi_per_unit']]
+
+        fig_per_unit = go.Figure()
+        fig_per_unit.add_trace(go.Bar(
+            name='Market Rate',
+            x=metrics_names,
+            y=market_per_unit,
+            marker_color='#1f77b4'
+        ))
+        fig_per_unit.add_trace(go.Bar(
+            name='Mixed Income',
+            x=metrics_names,
+            y=mixed_per_unit,
+            marker_color='#ff7f0e'
+        ))
+
+        fig_per_unit.update_layout(
+            barmode='group',
+            yaxis_tickformat="$,.0f",
+            yaxis_title="$ per Unit",
+            height=350,
+            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+        )
+
+        st.plotly_chart(fig_per_unit, use_container_width=True)
+
+    with metrics_tab4:
+        st.markdown("#### Operating Period Cash Flows")
+        st.caption("Excludes reversion period to show operational detail")
+
+        # Get operations-only cash flows (exclude reversion)
+        market_ops_cfs = market_dev['leaseup_cfs'] + market_dev['ops_cfs']
+        mixed_ops_cfs = mixed_dev['leaseup_cfs'] + mixed_dev['ops_cfs']
+
+        market_ops_levered = [cf.levered_cf for cf in market_ops_cfs]
+        mixed_ops_levered = [cf.levered_cf for cf in mixed_ops_cfs]
+        ops_months = [cf.month for cf in market_ops_cfs]
+
+        fig_ops = go.Figure()
+        fig_ops.add_trace(go.Scatter(
+            x=ops_months, y=market_ops_levered,
+            mode='lines', name='Market Rate',
+            line=dict(color='#1f77b4', width=2)
+        ))
+        fig_ops.add_trace(go.Scatter(
+            x=ops_months, y=mixed_ops_levered,
+            mode='lines', name='Mixed Income',
+            line=dict(color='#ff7f0e', width=2)
+        ))
+
+        fig_ops.update_layout(
+            title="Levered Cash Flows - Lease-Up & Operations Only",
+            xaxis_title="Month",
+            yaxis_title="Cash Flow ($)",
+            yaxis_tickformat="$,.0f",
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+            height=400,
+        )
+
+        st.plotly_chart(fig_ops, use_container_width=True)
+
+        # Annual Cash-on-Cash comparison
+        st.markdown("#### Annual Cash-on-Cash Returns")
+
+        market_years = sorted(market_dev['ops_cash_by_year'].keys())
+        mixed_years = sorted(mixed_dev['ops_cash_by_year'].keys())
+        all_years = sorted(set(market_years) | set(mixed_years))
+
+        if all_years and market_dev['total_equity_invested'] > 0 and mixed_dev['total_equity_invested'] > 0:
+            market_coc = [market_dev['ops_cash_by_year'].get(y, 0) / market_dev['total_equity_invested'] * 100 for y in all_years]
+            mixed_coc = [mixed_dev['ops_cash_by_year'].get(y, 0) / mixed_dev['total_equity_invested'] * 100 for y in all_years]
+
+            fig_coc = go.Figure()
+            fig_coc.add_trace(go.Bar(
+                name='Market Rate',
+                x=[f"Year {y}" for y in all_years],
+                y=market_coc,
+                marker_color='#1f77b4'
+            ))
+            fig_coc.add_trace(go.Bar(
+                name='Mixed Income',
+                x=[f"Year {y}" for y in all_years],
+                y=mixed_coc,
+                marker_color='#ff7f0e'
+            ))
+
+            fig_coc.update_layout(
+                title="Annual Cash-on-Cash Return by Year",
+                barmode='group',
+                yaxis_title="Cash-on-Cash (%)",
+                yaxis_ticksuffix="%",
+                height=350,
+                legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+            )
+
+            st.plotly_chart(fig_coc, use_container_width=True)
+
+        # Reversion Comparison
+        st.markdown("#### Exit / Reversion Analysis")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Market Rate**")
+            if market_dev['reversion_cf']:
+                rev_cf = market_dev['reversion_cf'][0]
+                st.metric("Sale Proceeds", f"${rev_cf.sale_proceeds:,.0f}")
+                st.metric("Loan Payoff", f"${rev_cf.loan_payoff:,.0f}")
+                st.metric("Net to Equity", f"${rev_cf.net_sale_proceeds:,.0f}")
+
+        with col2:
+            st.markdown("**Mixed Income**")
+            if mixed_dev['reversion_cf']:
+                rev_cf = mixed_dev['reversion_cf'][0]
+                market_rev = market_dev['reversion_cf'][0] if market_dev['reversion_cf'] else None
+
+                sale_diff = rev_cf.sale_proceeds - (market_rev.sale_proceeds if market_rev else 0)
+                st.metric("Sale Proceeds", f"${rev_cf.sale_proceeds:,.0f}",
+                         delta=f"${sale_diff:+,.0f}")
+
+                payoff_diff = rev_cf.loan_payoff - (market_rev.loan_payoff if market_rev else 0)
+                st.metric("Loan Payoff", f"${rev_cf.loan_payoff:,.0f}",
+                         delta=f"${payoff_diff:+,.0f}", delta_color="inverse")
+
+                net_diff = rev_cf.net_sale_proceeds - (market_rev.net_sale_proceeds if market_rev else 0)
+                st.metric("Net to Equity", f"${rev_cf.net_sale_proceeds:,.0f}",
+                         delta=f"${net_diff:+,.0f}")
+
+        # Reversion vs TDC comparison
+        st.markdown("#### Exit Value vs Development Cost")
+
+        fig_exit = go.Figure()
+
+        scenarios = ['Market Rate', 'Mixed Income']
+        tdc_values = [market_dev['tdc'], mixed_dev['tdc']]
+
+        market_sale = market_dev['reversion_cf'][0].sale_proceeds if market_dev['reversion_cf'] else 0
+        mixed_sale = mixed_dev['reversion_cf'][0].sale_proceeds if mixed_dev['reversion_cf'] else 0
+        sale_values = [market_sale, mixed_sale]
+
+        fig_exit.add_trace(go.Bar(
+            name='Total Development Cost',
+            x=scenarios,
+            y=tdc_values,
+            marker_color='#e74c3c'
+        ))
+        fig_exit.add_trace(go.Bar(
+            name='Exit Sale Value',
+            x=scenarios,
+            y=sale_values,
+            marker_color='#2ecc71'
+        ))
+
+        fig_exit.update_layout(
+            barmode='group',
+            yaxis_tickformat="$,.0f",
+            height=350,
+            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+        )
+
+        st.plotly_chart(fig_exit, use_container_width=True)
+
+    # ========== DIAGNOSTIC SECTION ==========
+    with st.expander("🔧 IRR Diagnostic (Compare with Excel)", expanded=False):
+        st.markdown("""
+        **Use this section to compare key values with your Excel model to identify discrepancies.**
+        """)
+
+        # Get timeline info
+        predev_months = st.session_state.get("predevelopment_months", 18)
+        const_months = st.session_state.get("construction_months", 24)
+        leaseup_months = st.session_state.get("leaseup_months", 12)
+        ops_months = st.session_state.get("operations_months", 60)
+        total_months = predev_months + const_months + leaseup_months + ops_months
+
+        st.markdown("#### Timeline")
+        st.markdown(f"- Predevelopment: Months 1-{predev_months}")
+        st.markdown(f"- Construction: Months {predev_months+1}-{predev_months+const_months}")
+        st.markdown(f"- Lease-up: Months {predev_months+const_months+1}-{predev_months+const_months+leaseup_months}")
+        st.markdown(f"- Operations: Months {predev_months+const_months+leaseup_months+1}-{total_months}")
+        st.markdown(f"- **Equity invested at Month {predev_months+1}** (construction start)")
+
+        st.divider()
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("#### Market Rate")
+            st.markdown(f"**TDC:** ${market_metrics.tdc:,.0f}")
+            st.markdown(f"**Construction Loan:** ${market_metrics.debt_amount:,.0f}")
+            st.markdown(f"**Equity Required:** ${market_metrics.equity_required:,.0f}")
+            st.markdown(f"**TIF Lump Sum:** ${market_metrics.tif_value:,.0f}")
+            st.divider()
+            st.markdown(f"**Annual GPR:** ${market_metrics.gpr_annual:,.0f}")
+            st.markdown(f"**Annual NOI:** ${market_metrics.noi_annual:,.0f}")
+            st.markdown(f"**Yield on Cost:** {market_metrics.yield_on_cost:.2%}")
+            st.divider()
+            if market_dev['reversion_cf']:
+                rev = market_dev['reversion_cf'][0]
+                st.markdown(f"**Sale Price:** ${rev.sale_proceeds:,.0f}")
+                st.markdown(f"**Loan Payoff:** ${rev.loan_payoff:,.0f}")
+                st.markdown(f"**Net to Equity:** ${rev.net_sale_proceeds:,.0f}")
+            st.divider()
+            st.markdown(f"**Levered IRR:** {market_metrics.levered_irr:.2%}")
+            st.markdown(f"**Unlevered IRR:** {market_metrics.unlevered_irr:.2%}")
+
+        with col2:
+            st.markdown("#### Mixed Income")
+            st.markdown(f"**TDC:** ${mixed_metrics.tdc:,.0f}")
+            st.markdown(f"**Construction Loan:** ${mixed_metrics.debt_amount:,.0f}")
+            st.markdown(f"**Equity Required:** ${mixed_metrics.equity_required:,.0f}")
+            st.markdown(f"**TIF Lump Sum:** ${mixed_metrics.tif_value:,.0f}")
+            st.divider()
+            st.markdown(f"**Annual GPR:** ${mixed_metrics.gpr_annual:,.0f}")
+            st.markdown(f"**Annual NOI:** ${mixed_metrics.noi_annual:,.0f}")
+            st.markdown(f"**Yield on Cost:** {mixed_metrics.yield_on_cost:.2%}")
+            st.divider()
+            if mixed_dev['reversion_cf']:
+                rev = mixed_dev['reversion_cf'][0]
+                st.markdown(f"**Sale Price:** ${rev.sale_proceeds:,.0f}")
+                st.markdown(f"**Loan Payoff:** ${rev.loan_payoff:,.0f}")
+                st.markdown(f"**Net to Equity:** ${rev.net_sale_proceeds:,.0f}")
+            st.divider()
+            st.markdown(f"**Levered IRR:** {mixed_metrics.levered_irr:.2%}")
+            st.markdown(f"**Unlevered IRR:** {mixed_metrics.unlevered_irr:.2%}")
+
+        st.divider()
+        st.markdown("#### Cash Flow Summary (First 5 Years of Operations)")
+
+        # Show monthly CF summary
+        ops_start = predev_months + const_months + leaseup_months + 1
+        market_ops = [cf for cf in market_result.monthly_cash_flows if cf.phase.value == "operations"][:60]
+        mixed_ops = [cf for cf in mixed_result.monthly_cash_flows if cf.phase.value == "operations"][:60]
+
+        if market_ops:
+            # Annual totals
+            market_annual = {}
+            mixed_annual = {}
+            for i, (m_cf, x_cf) in enumerate(zip(market_ops, mixed_ops)):
+                year = i // 12 + 1
+                market_annual[year] = market_annual.get(year, 0) + m_cf.levered_cf
+                mixed_annual[year] = mixed_annual.get(year, 0) + x_cf.levered_cf
+
+            cf_data = {
+                "Year": list(market_annual.keys()),
+                "Market Levered CF": [f"${v:,.0f}" for v in market_annual.values()],
+                "Mixed Levered CF": [f"${v:,.0f}" for v in mixed_annual.values()],
+            }
+            st.dataframe(pd.DataFrame(cf_data), use_container_width=True, hide_index=True)
+
+        st.warning("""
+        **Known Issue:** Equity is currently invested at construction start (Month 19 with default timing),
+        not at Month 1 when land is typically acquired. This delays the cash outflow and inflates IRR.
+        Excel models typically invest equity at Month 1 or split between land (Month 1) and construction.
+        """)
 
 
 def render_matrix_tab(inputs: ProjectInputs):
-    """Render the scenario matrix tab."""
-    st.subheader("Scenario Matrix Analysis")
-    st.caption("Test all incentive combinations to find the best package")
+    """Render the scenario matrix analysis tab.
 
-    tier_options = st.multiselect(
-        "Tiers to Test",
-        options=[1, 2, 3],
-        default=[st.session_state.get("selected_tier", 2)],
-        format_func=lambda x: f"Tier {x}"
-    )
+    This tab is for testing multiple tier/incentive combinations to find
+    optimal packages. Primary incentive configuration is on the Scenarios tab.
+    """
+    st.header("Scenario Matrix Analysis")
+    st.markdown("""
+    Test multiple incentive tier and toggle combinations to find packages that meet your target returns.
+    Configure your primary scenario on the **Scenarios** tab.
+    """)
 
+    # Current configuration summary
+    current_tier = st.session_state.get("selected_tier", 2)
+    affordable_pct_raw = st.session_state.get("affordable_pct", 20.0)
+    affordable_pct = affordable_pct_raw if affordable_pct_raw <= 1 else affordable_pct_raw / 100
+    ami_level = st.session_state.get("ami_level", "50%")
+
+    st.info(f"**Current Configuration:** Tier {current_tier} | {affordable_pct:.0%} Affordable | {ami_level} AMI")
+
+    st.divider()
+
+    # Matrix configuration
+    st.subheader("Matrix Configuration")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        tier_options = st.multiselect(
+            "Tiers to Test",
+            options=[1, 2, 3],
+            default=[1, 2, 3],
+            format_func=lambda x: f"Tier {x}",
+            help="Select which incentive tiers to include in the matrix"
+        )
+
+    with col2:
+        st.caption("**Tier Descriptions:**")
+        st.caption("- Tier 1: 5% @ 30% AMI (deep affordability)")
+        st.caption("- Tier 2: 20% @ 50% AMI (moderate, more units)")
+        st.caption("- Tier 3: 10% @ 50% AMI (moderate, balanced)")
+
+    st.divider()
+
+    # Run button
     if st.button("Run Scenario Matrix", type="primary"):
         if not tier_options:
             st.warning("Please select at least one tier to test")
@@ -790,6 +1930,8 @@ def render_matrix_tab(inputs: ProjectInputs):
     if "matrix_results" in st.session_state:
         results = st.session_state["matrix_results"]
 
+        st.subheader("Results")
+
         # Summary metrics
         meeting_target = sum(1 for r in results if r.comparison.meets_target)
         col1, col2, col3 = st.columns(3)
@@ -803,36 +1945,52 @@ def render_matrix_tab(inputs: ProjectInputs):
 
         st.divider()
 
-        # Results table
+        # Results table with explicit incentive columns
         table_data = []
         for i, r in enumerate(results, 1):
+            combo = r.combination
+
+            # Get tier value (IncentiveTier enum has .value)
+            tier_num = combo.tier.value if hasattr(combo.tier, 'value') else combo.tier
+
             table_data.append({
                 "Rank": i,
-                "Scenario": r.combination.name,
-                "Market IRR": f"{r.market_metrics.levered_irr:.2%}",
-                "Mixed IRR": f"{r.mixed_metrics.levered_irr:.2%}",
-                "Difference (bps)": r.comparison.irr_difference_bps,
-                "Meets Target": "✅" if r.comparison.meets_target else "❌",
+                "Tier": tier_num,
+                "TIF Lump": "✓" if combo.tif_lump_sum else "",
+                "TIF Stream": "✓" if combo.tif_stream else "",
+                "SMART": "✓" if combo.smart_fee_waiver else "",
+                "Abatement": "✓" if combo.tax_abatement else "",
+                "Buydown": "✓" if combo.interest_buydown else "",
+                "Mkt IRR": r.market_metrics.levered_irr * 100,  # Convert to percentage
+                "Mix IRR": r.mixed_metrics.levered_irr * 100,
+                "Δ bps": r.comparison.irr_difference_bps,
+                "Target": "✓" if r.comparison.meets_target else "",
             })
 
         df = pd.DataFrame(table_data)
 
-        # Style the dataframe
+        # Style the dataframe with sortable columns
         st.dataframe(
             df,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Rank": st.column_config.NumberColumn("Rank", width="small"),
-                "Scenario": st.column_config.TextColumn("Scenario", width="medium"),
-                "Market IRR": st.column_config.TextColumn("Market IRR", width="small"),
-                "Mixed IRR": st.column_config.TextColumn("Mixed IRR", width="small"),
-                "Difference (bps)": st.column_config.NumberColumn(
-                    "Diff (bps)", width="small", format="%+d"
-                ),
-                "Meets Target": st.column_config.TextColumn("Target", width="small"),
+                "Rank": st.column_config.NumberColumn("#", width="small"),
+                "Tier": st.column_config.NumberColumn("Tier", width="small"),
+                "TIF Lump": st.column_config.TextColumn("TIF Lump", width="small"),
+                "TIF Stream": st.column_config.TextColumn("TIF Stream", width="small"),
+                "SMART": st.column_config.TextColumn("SMART", width="small"),
+                "Abatement": st.column_config.TextColumn("Abate", width="small"),
+                "Buydown": st.column_config.TextColumn("Buydown", width="small"),
+                "Mkt IRR": st.column_config.NumberColumn("Mkt IRR", width="small", format="%.2f%%"),
+                "Mix IRR": st.column_config.NumberColumn("Mix IRR", width="small", format="%.2f%%"),
+                "Δ bps": st.column_config.NumberColumn("Δ bps", width="small", format="%+d"),
+                "Target": st.column_config.TextColumn("✓?", width="small"),
             }
         )
+
+        # Legend
+        st.caption("✓ = Incentive active | Click column headers to sort | TIF and Abatement are mutually exclusive")
 
         # Best combination details
         if results and results[0].comparison.meets_target:
@@ -843,149 +2001,141 @@ def render_matrix_tab(inputs: ProjectInputs):
             improvement over market rate.
             """)
 
+            # Option to apply best combination
+            if st.button("Apply Best Combination to Scenarios Tab"):
+                best = results[0]
+                # Extract tier from combination name and update session state
+                st.session_state["matrix_applied"] = True
+                st.info("Navigate to the **Scenarios** tab to see the updated configuration.")
+
 
 def render_detailed_cashflow_tab(inputs: ProjectInputs):
-    """Render the detailed cash flow tab."""
+    """Render the detailed cash flow tab with separate Market Rate and Mixed Income views."""
     st.subheader("Detailed Cash Flow Analysis")
 
-    # Export button in top-right corner
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        export_placeholder = st.empty()
-
-    # Calculate average GSF for revenue estimation
+    # Calculate common inputs
     total_gsf = sum(
         inputs.unit_mix[ut].gsf * inputs.unit_mix[ut].allocation
         for ut in inputs.unit_mix
     )
-    avg_gsf = total_gsf
-    monthly_gpr = inputs.target_units * avg_gsf * inputs.market_rent_psf
-
-    # Calculate hard costs
     hard_costs = inputs.target_units * inputs.hard_cost_per_unit
-
-    # Calculate annual opex per unit
     annual_opex_per_unit = inputs.opex_utilities + inputs.opex_maintenance + inputs.opex_misc
 
-    # Get mezzanine and preferred from session state (set in Sources & Uses tab)
+    # Get capital stack from session state
     mezzanine_debt = st.session_state.get("mezzanine_debt", 0)
     mezzanine_rate = st.session_state.get("mezzanine_rate_pct", 12.0) / 100
     preferred_equity = st.session_state.get("preferred_equity", 0)
     preferred_return = st.session_state.get("preferred_return_pct", 10.0) / 100
 
+    # Get TIF lump sum from Property Tax tab calculation
+    tif_lump_sum = st.session_state.get("calculated_tif_lump_sum", 0)
+
+    # Common parameters for cash flow generation
+    common_params = {
+        "land_cost": inputs.land_cost_per_acre,
+        "hard_costs": hard_costs,
+        "soft_cost_pct": inputs.soft_cost_pct,
+        "construction_ltc": inputs.construction_ltc,
+        "construction_rate": inputs.construction_rate,
+        "start_date": inputs.predevelopment_start,
+        "predevelopment_months": inputs.predevelopment_months,
+        "construction_months": inputs.construction_months,
+        "leaseup_months": inputs.leaseup_months,
+        "operations_months": inputs.operations_months,
+        "vacancy_rate": inputs.vacancy_rate,
+        "leaseup_pace": inputs.leaseup_pace,
+        "max_occupancy": inputs.max_occupancy,
+        "annual_opex_per_unit": annual_opex_per_unit,
+        "total_units": inputs.target_units,
+        "existing_assessed_value": inputs.existing_assessed_value,
+        "market_rent_growth": inputs.market_rent_growth,
+        "opex_growth": inputs.opex_growth,
+        "prop_tax_growth": inputs.property_tax_growth,
+        "perm_rate": inputs.perm_rate,
+        "perm_amort_years": inputs.perm_amort_years,
+        "perm_ltv_max": inputs.perm_ltv_max,
+        "perm_dscr_min": inputs.perm_dscr_min,
+        "exit_cap_rate": inputs.exit_cap_rate,
+        "reserves_pct": inputs.reserves_pct,
+        "mezzanine_amount": mezzanine_debt,
+        "mezzanine_rate": mezzanine_rate,
+        "mezzanine_io": True,
+        "preferred_amount": preferred_equity,
+        "preferred_return": preferred_return,
+    }
+
     try:
-        # Generate detailed cash flow
-        result = generate_detailed_cash_flow(
-            land_cost=inputs.land_cost_per_acre,  # Simplified: 1 acre
-            hard_costs=hard_costs,
-            soft_cost_pct=inputs.soft_cost_pct,
-            construction_ltc=inputs.construction_ltc,
-            construction_rate=inputs.construction_rate,
-            start_date=inputs.predevelopment_start,
-            predevelopment_months=inputs.predevelopment_months,
-            construction_months=inputs.construction_months,
-            leaseup_months=inputs.leaseup_months,
-            operations_months=inputs.operations_months,
-            monthly_gpr_at_stabilization=monthly_gpr,
-            vacancy_rate=inputs.vacancy_rate,
-            leaseup_pace=inputs.leaseup_pace,
-            max_occupancy=inputs.max_occupancy,
-            annual_opex_per_unit=annual_opex_per_unit,
-            total_units=inputs.target_units,
-            existing_assessed_value=inputs.existing_assessed_value,
-            market_rent_growth=inputs.market_rent_growth,
-            opex_growth=inputs.opex_growth,
-            prop_tax_growth=inputs.property_tax_growth,
-            perm_rate=inputs.perm_rate,
-            perm_amort_years=inputs.perm_amort_years,
-            perm_ltv_max=inputs.perm_ltv_max,
-            perm_dscr_min=inputs.perm_dscr_min,
-            exit_cap_rate=inputs.exit_cap_rate,
-            reserves_pct=inputs.reserves_pct,
-            affordable_pct=inputs.affordable_pct,
-            # Mezzanine debt
-            mezzanine_amount=mezzanine_debt,
-            mezzanine_rate=mezzanine_rate,
-            mezzanine_io=True,  # Interest-only
-            # Preferred equity
-            preferred_amount=preferred_equity,
-            preferred_return=preferred_return,
-            # TIF treatment from scenario config
-            tif_treatment=_get_tif_treatment_str(),
-            tif_lump_sum=st.session_state.get("tif_lump_sum_source", 0),
-            tif_abatement_pct=st.session_state.get("abate_pct", 0) / 100,
-            tif_abatement_years=st.session_state.get("abate_term", 0),
-            tif_stream_pct=st.session_state.get("scenario_b_stream_pct", 100) / 100,
-            tif_stream_years=st.session_state.get("scenario_b_stream_years", 20),
+        # Calculate market rate GPR (100% market rents)
+        market_monthly_gpr = inputs.target_units * total_gsf * inputs.market_rent_psf
+
+        # Calculate mixed income GPR (blended market + affordable)
+        affordable_pct = st.session_state.get("affordable_pct", 20.0)
+        if affordable_pct > 1:
+            affordable_pct = affordable_pct / 100
+        # Estimate affordable rent discount (typically 60-70% of market)
+        affordable_rent_discount = 0.65
+        mixed_monthly_gpr = market_monthly_gpr * (1 - affordable_pct * (1 - affordable_rent_discount))
+
+        # Generate MARKET RATE cash flow (no incentives)
+        market_result = generate_detailed_cash_flow(
+            **common_params,
+            monthly_gpr_at_stabilization=market_monthly_gpr,
+            affordable_pct=0.0,  # No affordable units
+            tif_treatment="none",
+            tif_lump_sum=0,
+            tif_abatement_pct=0,
+            tif_abatement_years=0,
+            tif_stream_pct=0,
+            tif_stream_years=0,
+            tif_start_delay_months=0,
+        )
+
+        # Generate MIXED INCOME cash flow (with incentives)
+        tif_treatment = _get_tif_treatment_str()
+        mixed_result = generate_detailed_cash_flow(
+            **common_params,
+            monthly_gpr_at_stabilization=mixed_monthly_gpr,
+            affordable_pct=affordable_pct,
+            tif_treatment=tif_treatment,
+            tif_lump_sum=tif_lump_sum if tif_treatment == "lump_sum" else 0,
+            tif_abatement_pct=st.session_state.get("abate_pct", 100) / 100 if tif_treatment == "abatement" else 0,
+            tif_abatement_years=st.session_state.get("abate_term", 15) if tif_treatment == "abatement" else 0,
+            tif_stream_pct=st.session_state.get("scenario_b_stream_pct", 100) / 100 if tif_treatment == "stream" else 0,
+            tif_stream_years=st.session_state.get("scenario_b_stream_years", 20) if tif_treatment == "stream" else 0,
             tif_start_delay_months=st.session_state.get("scenario_b_tif_delay", 0),
         )
 
-        # Calculate equity multiple for header
-        total_equity_out = abs(sum(p.levered_cf for p in result.periods if p.levered_cf < 0))
-        total_distributions = sum(p.levered_cf for p in result.periods if p.levered_cf > 0)
-        equity_multiple = total_distributions / total_equity_out if total_equity_out > 0 else 0
+        # =====================================================================
+        # COMPARISON OPERATING STATEMENT
+        # =====================================================================
+        st.markdown("### Stabilized Operating Statement Comparison")
 
-        # Deal summary header
-        render_deal_summary_header(
-            tdc=result.sources_uses.tdc,
-            units=inputs.target_units,
-            equity=result.sources_uses.equity,
-            senior_debt=result.sources_uses.construction_loan,
-            levered_irr=result.levered_irr,
-            equity_multiple=equity_multiple,
-        )
+        _render_operating_statement_comparison(market_result, mixed_result, inputs.target_units)
 
         st.divider()
 
-        # Export button
-        with export_placeholder:
-            csv_data = export_cashflow_to_csv(result)
-            st.download_button(
-                label="Export CSV",
-                data=csv_data,
-                file_name="detailed_cashflow.csv",
-                mime="text/csv",
+        # =====================================================================
+        # SUB-TABS FOR DETAILED CASH FLOWS
+        # =====================================================================
+        cf_tab1, cf_tab2 = st.tabs(["Market Rate Cash Flows", "Mixed Income Cash Flows"])
+
+        with cf_tab1:
+            _render_scenario_cashflow(
+                result=market_result,
+                scenario_name="Market Rate",
+                inputs=inputs,
+                has_incentives=False,
+                tif_lump_sum=0,
             )
 
-        # Render Sources & Uses
-        render_sources_uses(result.sources_uses)
-
-        st.divider()
-
-        # Render IRR Summary
-        render_irr_summary(result)
-
-        st.divider()
-
-        # Stabilized Operating Statement
-        render_operating_statement(result)
-
-        st.divider()
-
-        # Period aggregation selector
-        aggregation = st.radio(
-            "View by",
-            options=["monthly", "quarterly", "annual"],
-            index=0,
-            key="cf_aggregation",
-            horizontal=True
-        )
-
-        # Render detailed cash flow table with native horizontal scroll
-        render_detailed_cashflow_table(
-            result,
-            aggregation=aggregation,
-        )
-
-        st.divider()
-
-        # Exit waterfall
-        render_exit_waterfall(result)
-
-        st.divider()
-
-        # Sensitivity analysis
-        render_sensitivity_analysis(result, {})
+        with cf_tab2:
+            _render_scenario_cashflow(
+                result=mixed_result,
+                scenario_name="Mixed Income",
+                inputs=inputs,
+                has_incentives=True,
+                tif_lump_sum=tif_lump_sum if tif_treatment == "lump_sum" else 0,
+            )
 
     except Exception as e:
         st.error(f"Error generating detailed cash flow: {e}")
@@ -993,17 +2143,375 @@ def render_detailed_cashflow_tab(inputs: ProjectInputs):
         st.code(traceback.format_exc())
 
 
+def _render_operating_statement_comparison(market_result, mixed_result, total_units: int):
+    """Render side-by-side operating statement comparison."""
+    # Get stabilized period data
+    market_stab = market_result.periods[-1] if market_result.periods else None
+    mixed_stab = mixed_result.periods[-1] if mixed_result.periods else None
+
+    if not market_stab or not mixed_stab:
+        st.warning("No stabilized period data available")
+        return
+
+    # Build comparison data - use operations fields which are floats
+    def get_annual(val):
+        return val * 12 if val else 0
+
+    # Extract values from the nested dataclass structure
+    market_ops = market_stab.operations
+    mixed_ops = mixed_stab.operations
+
+    # Get debt service from permanent debt row (pmt_in_period = total payment)
+    market_debt_svc = market_stab.permanent_debt.pmt_in_period if market_stab.permanent_debt else 0
+    mixed_debt_svc = mixed_stab.permanent_debt.pmt_in_period if mixed_stab.permanent_debt else 0
+
+    rows = [
+        ("Gross Potential Rent", get_annual(market_ops.gpr), get_annual(mixed_ops.gpr)),
+        ("Less: Vacancy", get_annual(market_ops.less_vacancy), get_annual(mixed_ops.less_vacancy)),
+        ("Effective Gross Income", get_annual(market_ops.egi), get_annual(mixed_ops.egi)),
+        ("", None, None),  # Spacer
+        ("Operating Expenses", get_annual(market_ops.less_opex_ex_taxes), get_annual(mixed_ops.less_opex_ex_taxes)),
+        ("Property Taxes", get_annual(market_ops.less_property_taxes), get_annual(mixed_ops.less_property_taxes)),
+        ("Net Operating Income", get_annual(market_ops.noi), get_annual(mixed_ops.noi)),
+        ("", None, None),  # Spacer
+        ("Debt Service", -get_annual(market_debt_svc), -get_annual(mixed_debt_svc)),
+        ("Cash Flow Before Tax", get_annual(market_stab.levered_cf), get_annual(mixed_stab.levered_cf)),
+    ]
+
+    col1, col2, col3, col4 = st.columns([2, 1.2, 1.2, 1.2])
+
+    with col1:
+        st.markdown("**Line Item**")
+    with col2:
+        st.markdown("**Market Rate**")
+    with col3:
+        st.markdown("**Mixed Income**")
+    with col4:
+        st.markdown("**Difference**")
+
+    for label, market_val, mixed_val in rows:
+        col1, col2, col3, col4 = st.columns([2, 1.2, 1.2, 1.2])
+
+        with col1:
+            if label == "":
+                st.markdown("---")
+            elif label in ["Effective Gross Income", "Net Operating Income", "Cash Flow Before Tax"]:
+                st.markdown(f"**{label}**")
+            else:
+                st.markdown(label)
+
+        if market_val is not None:
+            diff = mixed_val - market_val
+
+            with col2:
+                if label in ["Effective Gross Income", "Net Operating Income", "Cash Flow Before Tax"]:
+                    st.markdown(f"**${market_val:,.0f}**")
+                else:
+                    st.markdown(f"${market_val:,.0f}")
+
+            with col3:
+                if label in ["Effective Gross Income", "Net Operating Income", "Cash Flow Before Tax"]:
+                    st.markdown(f"**${mixed_val:,.0f}**")
+                else:
+                    st.markdown(f"${mixed_val:,.0f}")
+
+            with col4:
+                color = "green" if diff >= 0 else "red"
+                if label in ["Effective Gross Income", "Net Operating Income", "Cash Flow Before Tax"]:
+                    st.markdown(f"**:{color}[${diff:+,.0f}]**")
+                else:
+                    st.markdown(f":{color}[${diff:+,.0f}]")
+        else:
+            with col2:
+                st.markdown("---")
+            with col3:
+                st.markdown("---")
+            with col4:
+                st.markdown("---")
+
+    # Summary metrics
+    st.divider()
+    col1, col2, col3, col4 = st.columns(4)
+
+    market_noi = get_annual(market_stab.operations.noi)
+    mixed_noi = get_annual(mixed_stab.operations.noi)
+
+    with col1:
+        st.metric("Market NOI", f"${market_noi:,.0f}")
+    with col2:
+        st.metric("Mixed NOI", f"${mixed_noi:,.0f}")
+    with col3:
+        noi_diff = mixed_noi - market_noi
+        st.metric("NOI Difference", f"${noi_diff:+,.0f}",
+                 delta=f"{noi_diff/market_noi*100:+.1f}%" if market_noi else None,
+                 delta_color="off")
+    with col4:
+        st.metric("NOI/Unit (Mixed)", f"${mixed_noi/total_units:,.0f}")
+
+
+def _render_scenario_cashflow(result, scenario_name: str, inputs: ProjectInputs,
+                              has_incentives: bool, tif_lump_sum: float):
+    """Render detailed cash flow for a single scenario."""
+    # Calculate equity multiple
+    total_equity_out = abs(sum(p.levered_cf for p in result.periods if p.levered_cf < 0))
+    total_distributions = sum(p.levered_cf for p in result.periods if p.levered_cf > 0)
+    equity_multiple = total_distributions / total_equity_out if total_equity_out > 0 else 0
+
+    # Deal summary header
+    st.markdown(f"#### {scenario_name} Summary")
+    render_deal_summary_header(
+        tdc=result.sources_uses.tdc,
+        units=inputs.target_units,
+        equity=result.sources_uses.equity,
+        senior_debt=result.sources_uses.construction_loan,
+        levered_irr=result.levered_irr,
+        equity_multiple=equity_multiple,
+    )
+
+    if has_incentives and tif_lump_sum > 0:
+        st.success(f"**TIF Lump Sum Included:** ${tif_lump_sum:,.0f}")
+
+    st.divider()
+
+    # Sources & Uses with Drawdown Schedule
+    st.markdown("#### Sources & Uses")
+    render_sources_uses(result.sources_uses)
+
+    st.divider()
+
+    # Sources Drawdown Schedule
+    st.markdown("#### Capital Drawdown Schedule")
+    _render_drawdown_schedule(result, tif_lump_sum if has_incentives else 0)
+
+    st.divider()
+
+    # IRR Summary
+    st.markdown("#### Return Metrics")
+    render_irr_summary(result)
+
+    st.divider()
+
+    # Performance Metrics Tracking
+    st.markdown("#### Performance Metrics by Period")
+    _render_performance_metrics(result)
+
+    st.divider()
+
+    # Period aggregation selector
+    aggregation = st.radio(
+        "View by",
+        options=["monthly", "quarterly", "annual"],
+        index=2,  # Default to annual
+        key=f"cf_aggregation_{scenario_name.lower().replace(' ', '_')}",
+        horizontal=True
+    )
+
+    # Render detailed cash flow table
+    render_detailed_cashflow_table(result, aggregation=aggregation)
+
+    st.divider()
+
+    # Exit waterfall
+    render_exit_waterfall(result)
+
+    # Export button
+    csv_data = export_cashflow_to_csv(result)
+    st.download_button(
+        label=f"Export {scenario_name} CSV",
+        data=csv_data,
+        file_name=f"cashflow_{scenario_name.lower().replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"export_{scenario_name.lower().replace(' ', '_')}",
+    )
+
+
+def _render_drawdown_schedule(result, tif_lump_sum: float):
+    """Render sources drawdown schedule showing period-by-period funding."""
+    import pandas as pd
+
+    periods = result.periods
+    if not periods:
+        st.warning("No period data available")
+        return
+
+    # Get total sources
+    su = result.sources_uses
+    total_equity = su.equity
+    total_debt = su.construction_loan
+    total_tif = tif_lump_sum
+
+    # Build drawdown tracking
+    # Assumes: Equity first, then TIF (if any), then Debt
+    drawdown_data = []
+    cumulative_equity = 0
+    cumulative_tif = 0
+    cumulative_debt = 0
+    cumulative_uses = 0
+
+    # Group by quarter for readability
+    quarters = {}
+    for p in periods:
+        if p.period <= (result.construction_months + result.predevelopment_months if hasattr(result, 'construction_months') else 36):
+            q = (p.period - 1) // 3 + 1
+            if q not in quarters:
+                quarters[q] = {"uses": 0, "periods": []}
+            quarters[q]["uses"] += abs(min(0, p.unlevered_cf))
+            quarters[q]["periods"].append(p)
+
+    # Simplified drawdown logic
+    remaining_equity = total_equity
+    remaining_tif = total_tif
+    remaining_debt = total_debt
+
+    for q in sorted(quarters.keys())[:12]:  # Show first 12 quarters (3 years)
+        uses_this_q = quarters[q]["uses"]
+
+        # Draw from equity first
+        equity_draw = min(remaining_equity, uses_this_q)
+        remaining_equity -= equity_draw
+        cumulative_equity += equity_draw
+        uses_remaining = uses_this_q - equity_draw
+
+        # Then TIF
+        tif_draw = min(remaining_tif, uses_remaining)
+        remaining_tif -= tif_draw
+        cumulative_tif += tif_draw
+        uses_remaining -= tif_draw
+
+        # Then debt
+        debt_draw = min(remaining_debt, uses_remaining)
+        remaining_debt -= debt_draw
+        cumulative_debt += debt_draw
+
+        cumulative_uses += uses_this_q
+
+        drawdown_data.append({
+            "Quarter": f"Q{q}",
+            "Uses": uses_this_q,
+            "Equity Draw": equity_draw,
+            "TIF Draw": tif_draw,
+            "Debt Draw": debt_draw,
+            "Cum. Equity": cumulative_equity,
+            "Cum. TIF": cumulative_tif,
+            "Cum. Debt": cumulative_debt,
+            "Equity Avail.": remaining_equity,
+            "TIF Avail.": remaining_tif,
+            "Debt Avail.": remaining_debt,
+        })
+
+    df = pd.DataFrame(drawdown_data)
+
+    # Format for display
+    for col in df.columns:
+        if col != "Quarter":
+            df[col] = df[col].apply(lambda x: f"${x:,.0f}" if x > 0 else "-")
+
+    st.dataframe(df, use_container_width=True, hide_index=True, height=300)
+
+    # Summary
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Equity", f"${total_equity:,.0f}")
+    with col2:
+        st.metric("Total TIF", f"${total_tif:,.0f}" if total_tif > 0 else "$0")
+    with col3:
+        st.metric("Total Debt", f"${total_debt:,.0f}")
+    with col4:
+        st.metric("Total Sources", f"${total_equity + total_tif + total_debt:,.0f}")
+
+
+def _render_performance_metrics(result):
+    """Render DSCR, ROI, ROE, Cash-on-Cash tracking by period."""
+    import pandas as pd
+
+    periods = result.periods
+    if not periods:
+        st.warning("No period data available")
+        return
+
+    # Get equity for CoC calculation
+    total_equity = result.sources_uses.equity
+
+    # Build metrics by year
+    metrics_data = []
+    years_seen = set()
+
+    for p in periods:
+        year = p.period // 12 + 1
+        if year in years_seen or year > 10:  # Show max 10 years
+            continue
+
+        # Find all periods in this year
+        year_periods = [per for per in periods if per.period // 12 + 1 == year]
+        if not year_periods:
+            continue
+
+        years_seen.add(year)
+
+        # Annual metrics
+        annual_noi = sum(per.noi for per in year_periods)
+        annual_ds = sum(per.debt_service for per in year_periods)
+        annual_cf = sum(per.levered_cf for per in year_periods)
+
+        # DSCR = NOI / Debt Service
+        dscr = annual_noi / annual_ds if annual_ds > 0 else 0
+
+        # Cash-on-Cash = Annual CF / Equity
+        coc = annual_cf / total_equity if total_equity > 0 else 0
+
+        # Cumulative metrics for ROI/ROE
+        cumulative_cf = sum(per.levered_cf for per in periods if per.period <= year_periods[-1].period)
+
+        metrics_data.append({
+            "Year": year,
+            "Annual NOI": annual_noi,
+            "Debt Service": annual_ds,
+            "DSCR": dscr,
+            "Annual CF": annual_cf,
+            "Cash-on-Cash": coc,
+            "Cumulative CF": cumulative_cf,
+        })
+
+    if not metrics_data:
+        return
+
+    df = pd.DataFrame(metrics_data)
+
+    # Format for display
+    df_display = df.copy()
+    df_display["Annual NOI"] = df_display["Annual NOI"].apply(lambda x: f"${x:,.0f}")
+    df_display["Debt Service"] = df_display["Debt Service"].apply(lambda x: f"${x:,.0f}")
+    df_display["DSCR"] = df_display["DSCR"].apply(lambda x: f"{x:.2f}x")
+    df_display["Annual CF"] = df_display["Annual CF"].apply(lambda x: f"${x:,.0f}")
+    df_display["Cash-on-Cash"] = df_display["Cash-on-Cash"].apply(lambda x: f"{x:.1%}")
+    df_display["Cumulative CF"] = df_display["Cumulative CF"].apply(lambda x: f"${x:,.0f}")
+
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+    # Chart: DSCR over time
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**DSCR Trend**")
+        chart_df = df[["Year", "DSCR"]].set_index("Year")
+        st.line_chart(chart_df, height=200)
+
+    with col2:
+        st.markdown("**Cash-on-Cash Return**")
+        chart_df = df[["Year", "Cash-on-Cash"]].set_index("Year")
+        chart_df["Cash-on-Cash"] = chart_df["Cash-on-Cash"] * 100  # Convert to %
+        st.line_chart(chart_df, height=200)
+
+
 def render_property_tax_tab(inputs: ProjectInputs):
     """Render the property tax engine tab with TIF analysis."""
     # Import TIF analysis components
     from ui.components.tif_analysis_view import (
         render_tax_rate_breakdown,
-        render_tif_lump_sum_result,
-        render_tif_loan_schedule,
         render_smart_fee_waiver,
         render_city_tax_abatement,
     )
-    from src.calculations.property_tax import solve_tif_term
+    import pandas as pd
 
     st.subheader("Property Tax & TIF Analysis")
 
@@ -1058,42 +2566,94 @@ def render_property_tax_tab(inputs: ProjectInputs):
         st.markdown("### TIF Lump Sum Calculator")
         st.caption("Calculate the TIF lump sum value based on capitalized tax increment.")
 
+        # Show selected tier info
+        selected_tier = st.session_state.get("selected_tier", 2)
+        affordable_pct_display = st.session_state.get("affordable_pct", 20.0)
+        if affordable_pct_display > 1:
+            affordable_pct_display = affordable_pct_display  # Already percentage
+        else:
+            affordable_pct_display = affordable_pct_display * 100  # Convert to percentage
+        ami_level = st.session_state.get("ami_level", "50%")
+
+        st.info(f"**Using Tier {selected_tier}** from Scenarios tab: {affordable_pct_display:.0f}% affordable at {ami_level} AMI")
+
         # Inputs for TIF calculation
         col1, col2, col3 = st.columns(3)
 
+        # Helper to parse currency input (handles commas)
+        def parse_currency(val: str) -> float:
+            if not val:
+                return 0.0
+            return float(val.replace(",", "").replace("$", "").strip() or 0)
+
         with col1:
-            tif_base_value = st.number_input(
+            # Initialize with formatted value
+            if "tif_base_value_str" not in st.session_state:
+                st.session_state["tif_base_value_str"] = f"{inputs.existing_assessed_value:,.0f}"
+            else:
+                # Reformat to ensure commas on each render
+                current = parse_currency(st.session_state["tif_base_value_str"])
+                st.session_state["tif_base_value_str"] = f"{current:,.0f}"
+
+            tif_base_str = st.text_input(
                 "Base Assessed Value",
-                min_value=0.0,
-                value=float(inputs.existing_assessed_value),
-                step=100000.0,
-                format="%.0f",
-                key="tif_base_value",
+                key="tif_base_value_str",
                 help="Assessed value before development",
             )
+            tif_base_value = parse_currency(tif_base_str)
 
         with col2:
-            tif_new_value = st.number_input(
+            # Initialize with formatted value
+            if "tif_new_value_str" not in st.session_state:
+                st.session_state["tif_new_value_str"] = f"{tdc:,.0f}"
+            else:
+                # Reformat to ensure commas on each render
+                current = parse_currency(st.session_state["tif_new_value_str"])
+                st.session_state["tif_new_value_str"] = f"{current:,.0f}"
+
+            tif_new_str = st.text_input(
                 "New Assessed Value (TDC)",
-                min_value=0.0,
-                value=float(tdc),
-                step=100000.0,
-                format="%.0f",
-                key="tif_new_value",
+                key="tif_new_value_str",
                 help="Typically equals TDC",
             )
+            tif_new_value = parse_currency(tif_new_str)
 
         with col3:
+            # Get affordable % from session state (set by Scenarios tab tier selection)
+            affordable_pct_raw = st.session_state.get("affordable_pct", 20.0)
+            affordable_pct = affordable_pct_raw / 100.0 if affordable_pct_raw > 1 else affordable_pct_raw
+            calculated_affordable_units = max(1, int(inputs.target_units * affordable_pct))
+
+            # Detect tier change and reset affordable units
+            prev_tier = st.session_state.get("_tif_prev_tier", None)
+            current_tier = st.session_state.get("selected_tier", 2)
+            if prev_tier is not None and prev_tier != current_tier:
+                # Tier changed - update affordable units to match new tier
+                st.session_state["tif_affordable_units"] = calculated_affordable_units
+            st.session_state["_tif_prev_tier"] = current_tier
+
             tif_affordable_units = st.number_input(
                 "Affordable Units",
                 min_value=1,
-                value=max(1, int(inputs.target_units * inputs.affordable_pct)),
+                value=calculated_affordable_units,
                 step=1,
                 key="tif_affordable_units",
+                help=f"Based on {affordable_pct:.0%} affordable from Scenarios tab tier selection",
             )
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
+            tif_term = st.number_input(
+                "TIF Term (years)",
+                min_value=5,
+                max_value=40,
+                value=20,
+                step=1,
+                key="prop_tif_term",
+                help="Number of years for TIF increment stream",
+            )
+
+        with col2:
             tif_cap_rate = st.slider(
                 "TIF Cap Rate",
                 min_value=5.0,
@@ -1102,46 +2662,133 @@ def render_property_tax_tab(inputs: ProjectInputs):
                 step=0.25,
                 format="%.2f%%",
                 key="prop_tif_cap_rate",
-                help="Cap rate for capitalizing tax increment",
+                help="Cap rate for capitalizing annual tax increment to lump sum",
             ) / 100
 
-        with col2:
-            tif_discount_rate = st.slider(
-                "Discount / Interest Rate",
-                min_value=1.0,
-                max_value=10.0,
-                value=3.0,
+        with col3:
+            tif_escalation_rate = st.slider(
+                "Increment Escalation Rate",
+                min_value=0.0,
+                max_value=5.0,
+                value=2.0,
                 step=0.25,
                 format="%.2f%%",
-                key="prop_tif_discount",
+                key="prop_tif_escalation",
+                help="Annual growth rate for tax increment",
             ) / 100
 
         st.divider()
 
-        # Calculate and display TIF lump sum
-        tif_lump_sum = render_tif_lump_sum_result(
-            new_assessed_value=tif_new_value,
-            base_assessed_value=tif_base_value,
-            affordable_units=tif_affordable_units,
-            tif_cap_rate=tif_cap_rate,
-            discount_rate=tif_discount_rate,
-            tif_term=20,
-            tax_stack=tax_stack,
-        )
+        # Calculate TIF increment cashflows
+        incremental_value = tif_new_value - tif_base_value
+        city_rate = tax_stack.tif_participating_rate_decimal
+        annual_city_increment = incremental_value * city_rate
+
+        # Show calculation summary
+        st.markdown("### TIF Calculation")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Incremental Value", f"${incremental_value:,.0f}",
+                     help="New AV - Base AV")
+        with col2:
+            st.metric("City (TIF) Rate", f"{city_rate:.4%}",
+                     help="Combined rate of TIF-participating authorities")
+        with col3:
+            st.metric("Year 1 City Increment", f"${annual_city_increment:,.0f}",
+                     help="Annual tax increment captured by TIF")
 
         st.divider()
 
-        # TIF as loan schedule
-        if tif_lump_sum and tif_lump_sum > 0:
-            incremental_value = tif_new_value - tif_base_value
-            city_monthly_increment = (
-                incremental_value * tax_stack.tif_participating_rate_decimal / 12
-            )
-            render_tif_loan_schedule(
-                principal=tif_lump_sum,
-                annual_rate=tif_discount_rate,
-                monthly_payment=city_monthly_increment,
-            )
+        # Build and display TIF cashflow schedule
+        st.markdown("### TIF Increment Cashflow Schedule")
+        st.caption("Shows the tax increment stream over the TIF term in nominal and present value terms.")
+
+        tif_cashflows = []
+        total_nominal = 0
+        total_pv = 0
+
+        for year in range(1, tif_term + 1):
+            # Escalate the increment
+            year_increment = annual_city_increment * ((1 + tif_escalation_rate) ** (year - 1))
+            # PV using cap rate as discount
+            pv_factor = 1 / ((1 + tif_cap_rate) ** year)
+            year_pv = year_increment * pv_factor
+
+            total_nominal += year_increment
+            total_pv += year_pv
+
+            tif_cashflows.append({
+                "Year": year,
+                "Increment (Nominal)": year_increment,
+                "PV Factor": pv_factor,
+                "Increment (PV)": year_pv,
+                "Cumulative Nominal": total_nominal,
+                "Cumulative PV": total_pv,
+            })
+
+        cf_df = pd.DataFrame(tif_cashflows)
+
+        # Display chart and table
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            # Chart showing nominal vs PV
+            chart_df = cf_df[["Year", "Cumulative Nominal", "Cumulative PV"]].copy()
+            chart_df = chart_df.set_index("Year")
+            chart_df.columns = ["Cumulative (Nominal)", "Cumulative (PV)"]
+            st.line_chart(chart_df, height=300)
+
+        with col2:
+            # Formatted table
+            cf_display = cf_df.copy()
+            cf_display["Increment (Nominal)"] = cf_display["Increment (Nominal)"].apply(lambda x: f"${x:,.0f}")
+            cf_display["PV Factor"] = cf_display["PV Factor"].apply(lambda x: f"{x:.4f}")
+            cf_display["Increment (PV)"] = cf_display["Increment (PV)"].apply(lambda x: f"${x:,.0f}")
+            cf_display["Cumulative Nominal"] = cf_display["Cumulative Nominal"].apply(lambda x: f"${x:,.0f}")
+            cf_display["Cumulative PV"] = cf_display["Cumulative PV"].apply(lambda x: f"${x:,.0f}")
+
+            st.dataframe(cf_display, use_container_width=True, hide_index=True, height=300)
+
+        st.divider()
+
+        # TIF Lump Sum Result
+        st.markdown("### TIF Lump Sum Value")
+
+        # Simple capitalization: Year 1 Increment / Cap Rate
+        tif_lump_sum_simple = annual_city_increment / tif_cap_rate if tif_cap_rate > 0 else 0
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("TIF Lump Sum", f"${tif_lump_sum_simple:,.0f}",
+                     help="Year 1 Increment ÷ Cap Rate")
+        with col2:
+            per_unit = tif_lump_sum_simple / tif_affordable_units if tif_affordable_units > 0 else 0
+            st.metric("Per Affordable Unit", f"${per_unit:,.0f}")
+        with col3:
+            pct_of_tdc = tif_lump_sum_simple / tif_new_value if tif_new_value > 0 else 0
+            st.metric("% of TDC", f"{pct_of_tdc:.1%}")
+        with col4:
+            st.metric("Total PV of Stream", f"${total_pv:,.0f}",
+                     help="Sum of discounted increments over TIF term")
+
+        # Store in session state
+        st.session_state["calculated_tif_lump_sum"] = tif_lump_sum_simple
+
+        # Calculation explanation
+        with st.expander("Calculation Method", expanded=False):
+            st.markdown(f"""
+**Simple Capitalization Method:**
+- TIF Lump Sum = Year 1 City Increment ÷ Cap Rate
+- TIF Lump Sum = ${annual_city_increment:,.0f} ÷ {tif_cap_rate:.2%} = **${tif_lump_sum_simple:,.0f}**
+
+**Present Value Method (shown in table):**
+- Sum of annual increments discounted at cap rate over {tif_term} years
+- Total PV = **${total_pv:,.0f}**
+
+The simple capitalization method is typically used for quick estimates.
+The PV method shows the actual value of the increment stream.
+            """)
 
     with prop_tab3:
         st.markdown("### Incentive Programs")
@@ -1259,6 +2906,457 @@ def render_sources_uses_tab(inputs: ProjectInputs):
         st.code(traceback.format_exc())
 
 
+def render_monte_carlo_tab(inputs: ProjectInputs):
+    """Render Monte Carlo simulation tab."""
+    st.header("🎲 Monte Carlo Simulation")
+    st.markdown("""
+    Run Monte Carlo simulations to understand how uncertainty in key inputs affects project returns.
+    Select which inputs to vary, configure their distributions, and run the simulation.
+    """)
+
+    # Initialize session state for Monte Carlo
+    if "mc_results" not in st.session_state:
+        st.session_state.mc_results = None
+    if "mc_running" not in st.session_state:
+        st.session_state.mc_running = False
+
+    # Configuration section
+    st.subheader("Simulation Configuration")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        n_iterations = st.number_input(
+            "Number of Iterations",
+            min_value=100,
+            max_value=10000,
+            value=st.session_state.get("mc_iterations", 500),
+            step=100,
+            help="More iterations = more accurate but slower"
+        )
+        st.session_state.mc_iterations = n_iterations
+
+        confidence_level = st.slider(
+            "Confidence Level (%)",
+            min_value=80,
+            max_value=99,
+            value=int(st.session_state.get("mc_confidence", 0.95) * 100),
+            step=1,
+            help="Confidence level for intervals"
+        ) / 100  # Convert from % to decimal
+        st.session_state.mc_confidence = confidence_level
+
+    with col2:
+        seed = st.number_input(
+            "Random Seed (for reproducibility)",
+            min_value=1,
+            max_value=99999,
+            value=st.session_state.get("mc_seed", 42),
+            help="Same seed = same results"
+        )
+        st.session_state.mc_seed = seed
+
+        target_irr = st.number_input(
+            "Target IRR for Probability Calculation (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=st.session_state.get("mc_target_irr", 15.0),
+            step=1.0,
+            format="%.0f",
+            help="Calculate P(IRR > target)"
+        ) / 100  # Convert from % to decimal
+        st.session_state.mc_target_irr = target_irr
+
+    # Input selection
+    st.subheader("Select Inputs to Vary")
+    st.caption("Check inputs to include in the simulation. Configure min/mode/max values for each.")
+
+    # Define available inputs with their default ranges
+    available_inputs = {
+        "hard_costs": {
+            "label": "Hard Costs",
+            "category": "costs",
+            "default_mean": inputs.hard_cost_per_unit * inputs.target_units,
+            "default_cv": 0.10,
+            "distribution": DistributionType.LOGNORMAL,
+            "unit": "$",
+        },
+        "soft_cost_pct": {
+            "label": "Soft Cost %",
+            "category": "costs",
+            "default_min": 0.15,
+            "default_mode": inputs.soft_cost_pct,
+            "default_max": 0.30,
+            "distribution": DistributionType.TRIANGULAR,
+            "unit": "%",
+        },
+        "exit_cap_rate": {
+            "label": "Exit Cap Rate",
+            "category": "market",
+            "default_min": 0.045,
+            "default_mode": inputs.exit_cap_rate,
+            "default_max": 0.070,
+            "distribution": DistributionType.TRIANGULAR,
+            "unit": "%",
+        },
+        "market_rent_growth": {
+            "label": "Rent Growth",
+            "category": "market",
+            "default_min": 0.00,
+            "default_mode": inputs.market_rent_growth,
+            "default_max": 0.05,
+            "distribution": DistributionType.TRIANGULAR,
+            "unit": "%",
+        },
+        "vacancy_rate": {
+            "label": "Vacancy Rate",
+            "category": "market",
+            "default_min": 0.03,
+            "default_mode": inputs.vacancy_rate,
+            "default_max": 0.12,
+            "distribution": DistributionType.TRIANGULAR,
+            "unit": "%",
+        },
+        "perm_rate": {
+            "label": "Perm Loan Rate",
+            "category": "financing",
+            "default_min": 0.045,
+            "default_mode": inputs.perm_rate,
+            "default_max": 0.085,
+            "distribution": DistributionType.TRIANGULAR,
+            "unit": "%",
+        },
+        "construction_rate": {
+            "label": "Const. Loan Rate",
+            "category": "financing",
+            "default_min": 0.055,
+            "default_mode": inputs.construction_rate,
+            "default_max": 0.095,
+            "distribution": DistributionType.TRIANGULAR,
+            "unit": "%",
+        },
+        "construction_months": {
+            "label": "Construction (mo)",
+            "category": "timing",
+            "default_min": inputs.construction_months - 6,
+            "default_mode": inputs.construction_months,
+            "default_max": inputs.construction_months + 12,
+            "distribution": DistributionType.PERT,
+            "unit": "months",
+        },
+        "leaseup_months": {
+            "label": "Lease-Up (mo)",
+            "category": "timing",
+            "default_min": max(3, inputs.leaseup_months - 3),
+            "default_mode": inputs.leaseup_months,
+            "default_max": inputs.leaseup_months + 6,
+            "distribution": DistributionType.PERT,
+            "unit": "months",
+        },
+    }
+
+    # Create input configuration UI - organized by category in columns
+    selected_inputs = []
+    distributions = []
+
+    # Group inputs by category
+    categories = {
+        "costs": {"title": "Development Costs", "inputs": []},
+        "market": {"title": "Market Assumptions", "inputs": []},
+        "financing": {"title": "Financing", "inputs": []},
+        "timing": {"title": "Timing", "inputs": []},
+    }
+
+    for key, config in available_inputs.items():
+        categories[config["category"]]["inputs"].append((key, config))
+
+    # Render in a 4-column layout
+    cols = st.columns(4)
+
+    for col_idx, (cat_key, cat_data) in enumerate(categories.items()):
+        with cols[col_idx]:
+            st.markdown(f"**{cat_data['title']}**")
+
+            for key, config in cat_data["inputs"]:
+                # Checkbox for inclusion
+                include = st.checkbox(
+                    config['label'],
+                    value=st.session_state.get(f"mc_include_{key}", key in ["exit_cap_rate", "hard_costs", "vacancy_rate"]),
+                    key=f"mc_include_{key}"
+                )
+
+                if include:
+                    selected_inputs.append(key)
+
+                    if config["distribution"] == DistributionType.LOGNORMAL:
+                        # Lognormal uses mean and CV
+                        mean_val = st.number_input(
+                            "Mean",
+                            value=float(config["default_mean"]),
+                            key=f"mc_mean_{key}",
+                            format="%.0f",
+                            label_visibility="collapsed"
+                        )
+                        cv_val = st.slider(
+                            "CV",
+                            min_value=0.05,
+                            max_value=0.30,
+                            value=config["default_cv"],
+                            key=f"mc_cv_{key}",
+                            help="Coefficient of Variation"
+                        )
+                        distributions.append(InputDistribution(
+                            parameter=key,
+                            distribution=DistributionType.LOGNORMAL,
+                            mean=mean_val,
+                            std=mean_val * cv_val,
+                            clip_min=mean_val * 0.5,
+                        ))
+                    else:
+                        # Triangular/PERT uses min, mode, max
+                        is_pct = config["unit"] == "%"
+                        multiplier = 100 if is_pct else 1
+                        format_str = "%.1f" if is_pct else "%.0f"
+
+                        min_val = st.number_input(
+                            "Min",
+                            value=float(config["default_min"]) * multiplier,
+                            key=f"mc_min_{key}",
+                            format=format_str,
+                            label_visibility="collapsed"
+                        ) / multiplier
+
+                        mode_val = st.number_input(
+                            "Mode",
+                            value=float(config["default_mode"]) * multiplier,
+                            key=f"mc_mode_{key}",
+                            format=format_str,
+                            label_visibility="collapsed"
+                        ) / multiplier
+
+                        max_val = st.number_input(
+                            "Max",
+                            value=float(config["default_max"]) * multiplier,
+                            key=f"mc_max_{key}",
+                            format=format_str,
+                            label_visibility="collapsed"
+                        ) / multiplier
+
+                        # Show range summary
+                        if is_pct:
+                            st.caption(f"{min_val*100:.1f}% - {mode_val*100:.1f}% - {max_val*100:.1f}%")
+                        elif config["unit"] == "months":
+                            st.caption(f"{min_val:.0f} - {mode_val:.0f} - {max_val:.0f} mo")
+
+                        distributions.append(InputDistribution(
+                            parameter=key,
+                            distribution=config["distribution"],
+                            min_value=min_val,
+                            mode=mode_val,
+                            max_value=max_val,
+                        ))
+                else:
+                    # Show current value when not included
+                    if config["distribution"] == DistributionType.LOGNORMAL:
+                        st.caption(f"Fixed: ${config['default_mean']:,.0f}")
+                    elif config["unit"] == "%":
+                        st.caption(f"Fixed: {config['default_mode']*100:.1f}%")
+                    else:
+                        st.caption(f"Fixed: {config['default_mode']:.0f} {config['unit']}")
+
+    # Run simulation button
+    st.divider()
+
+    if len(distributions) == 0:
+        st.warning("Select at least one input to vary.")
+        run_disabled = True
+    else:
+        run_disabled = False
+        st.info(f"**{len(distributions)} inputs selected** for simulation with **{n_iterations:,} iterations**")
+
+    if st.button("🚀 Run Monte Carlo Simulation", disabled=run_disabled, type="primary"):
+        st.session_state.mc_running = True
+
+        # Build base inputs from session state
+        construction_type = st.session_state.get("construction_type", "podium_5over1")
+        efficiency = get_efficiency(construction_type)
+        unit_mix = get_unit_mix_from_session_state(efficiency)
+        total_units = inputs.target_units
+
+        # Calculate monthly GPR using allocate_units -> calculate_gpr
+        allocations = allocate_units(
+            total_units, unit_mix, 0.0,  # 0% affordable for base
+            inputs.ami_level, inputs.market_rent_psf
+        )
+        gpr_result = calculate_gpr(allocations)
+
+        base_inputs = BaseInputs(
+            land_cost=inputs.land_cost_per_acre * 2,  # Assuming 2 acres
+            hard_costs=inputs.hard_cost_per_unit * total_units,
+            soft_cost_pct=inputs.soft_cost_pct,
+            construction_ltc=inputs.construction_ltc,
+            construction_rate=inputs.construction_rate,
+            start_date=inputs.predevelopment_start,
+            predevelopment_months=inputs.predevelopment_months,
+            construction_months=inputs.construction_months,
+            leaseup_months=inputs.leaseup_months,
+            operations_months=inputs.operations_months,
+            monthly_gpr_at_stabilization=gpr_result.total_gpr_monthly,
+            vacancy_rate=inputs.vacancy_rate,
+            leaseup_pace=inputs.leaseup_pace,
+            max_occupancy=inputs.max_occupancy,
+            annual_opex_per_unit=4500,  # Default
+            total_units=total_units,
+            existing_assessed_value=inputs.existing_assessed_value,
+            assessed_value_basis=AssessedValueBasis.TDC,
+            market_rent_growth=inputs.market_rent_growth,
+            opex_growth=inputs.opex_growth,
+            prop_tax_growth=inputs.property_tax_growth,
+            perm_rate=inputs.perm_rate,
+            perm_amort_years=inputs.perm_amort_years,
+            perm_ltv_max=inputs.perm_ltv_max,
+            perm_dscr_min=inputs.perm_dscr_min,
+            exit_cap_rate=inputs.exit_cap_rate,
+            affordable_pct=inputs.affordable_pct,
+            affordable_rent_discount=0.40 if inputs.affordable_pct > 0 else 0.0,
+        )
+
+        config = MonteCarloConfig(
+            base_inputs=base_inputs,
+            distributions=distributions,
+            n_iterations=n_iterations,
+            seed=seed,
+            confidence_level=confidence_level,
+            parallel=True,
+        )
+
+        # Run with progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def update_progress(completed, total):
+            progress_bar.progress(completed / total)
+            status_text.text(f"Running iteration {completed:,} of {total:,}...")
+
+        try:
+            result = run_monte_carlo(config, target_irr=target_irr, progress_callback=update_progress)
+            st.session_state.mc_results = result
+            progress_bar.progress(1.0)
+            status_text.text("✅ Simulation complete!")
+        except Exception as e:
+            st.error(f"Error running simulation: {e}")
+            st.session_state.mc_results = None
+
+        st.session_state.mc_running = False
+
+    # Display results
+    if st.session_state.mc_results is not None:
+        result = st.session_state.mc_results
+
+        st.divider()
+        st.subheader("📈 Simulation Results")
+
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric(
+                "Mean Levered IRR",
+                f"{result.levered_irr_mean:.1%}",
+                delta=f"±{result.levered_irr_std:.1%} std"
+            )
+
+        with col2:
+            st.metric(
+                "Median Levered IRR",
+                f"{result.levered_irr_median:.1%}"
+            )
+
+        with col3:
+            st.metric(
+                f"{int(confidence_level*100)}% Confidence Interval",
+                f"[{result.levered_irr_ci_lower:.1%}, {result.levered_irr_ci_upper:.1%}]"
+            )
+
+        with col4:
+            st.metric(
+                f"P(IRR > {target_irr:.0%})",
+                f"{result.prob_levered_above_target:.1%}"
+            )
+
+        # Detailed results tabs
+        res_tab1, res_tab2, res_tab3 = st.tabs(["📊 Distribution", "🎯 Sensitivity", "📋 Summary"])
+
+        with res_tab1:
+            st.subheader("IRR Distribution")
+
+            # Create histogram data
+            levered_irrs = result.get_levered_irr_distribution()
+
+            # Use pandas for histogram
+            hist_df = pd.DataFrame({"Levered IRR": levered_irrs * 100})  # Convert to %
+
+            st.bar_chart(hist_df["Levered IRR"].value_counts(bins=30).sort_index())
+
+            # Percentiles table
+            st.subheader("Percentiles")
+            percentile_data = {
+                "Percentile": ["5th", "10th", "25th", "50th (Median)", "75th", "90th", "95th"],
+                "Levered IRR": [
+                    f"{result.levered_irr_percentiles[5]:.2%}",
+                    f"{result.levered_irr_percentiles[10]:.2%}",
+                    f"{result.levered_irr_percentiles[25]:.2%}",
+                    f"{result.levered_irr_percentiles[50]:.2%}",
+                    f"{result.levered_irr_percentiles[75]:.2%}",
+                    f"{result.levered_irr_percentiles[90]:.2%}",
+                    f"{result.levered_irr_percentiles[95]:.2%}",
+                ],
+                "Unlevered IRR": [
+                    f"{result.unlevered_irr_percentiles[5]:.2%}",
+                    f"{result.unlevered_irr_percentiles[10]:.2%}",
+                    f"{result.unlevered_irr_percentiles[25]:.2%}",
+                    f"{result.unlevered_irr_percentiles[50]:.2%}",
+                    f"{result.unlevered_irr_percentiles[75]:.2%}",
+                    f"{result.unlevered_irr_percentiles[90]:.2%}",
+                    f"{result.unlevered_irr_percentiles[95]:.2%}",
+                ],
+            }
+            st.dataframe(pd.DataFrame(percentile_data), hide_index=True, use_container_width=True)
+
+        with res_tab2:
+            st.subheader("Sensitivity Analysis")
+            st.markdown("Which inputs have the most impact on IRR?")
+
+            # Sort by absolute correlation
+            sorted_sens = sorted(
+                result.sensitivities,
+                key=lambda s: abs(s.correlation_levered),
+                reverse=True
+            )
+
+            sens_data = {
+                "Input": [s.parameter.replace("_", " ").title() for s in sorted_sens],
+                "Correlation (Levered)": [s.correlation_levered for s in sorted_sens],
+                "Correlation (Unlevered)": [s.correlation_unlevered for s in sorted_sens],
+                "Impact": ["🔴 High" if abs(s.correlation_levered) > 0.5
+                          else "🟡 Medium" if abs(s.correlation_levered) > 0.2
+                          else "🟢 Low" for s in sorted_sens],
+            }
+
+            st.dataframe(pd.DataFrame(sens_data), hide_index=True, use_container_width=True)
+
+            st.markdown("""
+            **Interpretation:**
+            - **Positive correlation**: Higher input value → Higher IRR
+            - **Negative correlation**: Higher input value → Lower IRR
+            - **Magnitude**: Closer to ±1.0 means stronger relationship
+            """)
+
+        with res_tab3:
+            st.subheader("Full Summary")
+            st.code(result.summary())
+
+
 def main():
     """Main application entry point."""
     st.title("🏠 Austin Affordable Housing Incentive Calculator")
@@ -1269,14 +3367,14 @@ def main():
 
     # Main content tabs
     tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "🎯 Scenarios",
         "⚙️ Project Inputs",
         "🏢 Unit Mix",
         "🏛️ Property Tax",
         "💵 Sources & Uses",
         "🎁 Incentives",
         "💰 Detailed Cash Flows",
-        "📊 Results"
+        "📊 Results",
+        "🎲 Monte Carlo"
     ])
 
     # Get inputs from session state
@@ -1307,27 +3405,24 @@ def main():
         analysis_success = False
 
     with tab0:
-        render_scenarios_tab()
-
-    with tab1:
         render_project_inputs_tab()
 
-    with tab2:
+    with tab1:
         render_unit_mix_tab()
 
-    with tab3:
+    with tab2:
         render_property_tax_tab(inputs)
 
-    with tab4:
+    with tab3:
         render_sources_uses_tab(inputs)
 
-    with tab5:
+    with tab4:
         render_matrix_tab(inputs)
 
-    with tab6:
+    with tab5:
         render_detailed_cashflow_tab(inputs)
 
-    with tab7:
+    with tab6:
         if analysis_success:
             # Check mode and render appropriate view
             mode = st.session_state.get("model_mode", ModelMode.COMPARISON)
@@ -1344,6 +3439,9 @@ def main():
                 render_results_tab(market_metrics, mixed_metrics, comparison, market_result, mixed_result)
         else:
             st.warning("Fix input errors to see results")
+
+    with tab7:
+        render_monte_carlo_tab(inputs)
 
 
 if __name__ == "__main__":
