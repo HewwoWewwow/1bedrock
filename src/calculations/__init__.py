@@ -8,13 +8,21 @@ from .taxes import calculate_property_taxes, PropertyTaxResult
 from .debt import size_construction_loan, size_permanent_loan, ConstructionLoan, PermanentLoan
 from .tif import calculate_tif_value, TIFResult
 from .dcf import run_dcf, DCFResult, MonthlyCashFlow
-from .metrics import calculate_metrics, ScenarioMetrics, compare_scenarios, ScenarioComparison
+from .metrics import (
+    calculate_metrics,
+    calculate_metrics_from_detailed,  # For unified engine
+    ScenarioMetrics,
+    compare_scenarios,
+    ScenarioComparison,
+)
 
-# Detailed cashflow module
+# Detailed cashflow module (unified calculation engine)
 from .detailed_cashflow import (
     AssessedValueBasis,
     generate_detailed_cash_flow,
+    calculate_deal,  # Unified entry point - SINGLE SOURCE OF TRUTH
     DetailedCashFlowResult,
+    DetailedPeriodCashFlow,
 )
 
 # Monte Carlo simulation module
@@ -51,14 +59,10 @@ from .property_tax import (
     TaxingAuthority,
     TaxingAuthorityStack,
     get_austin_tax_stack,
+    build_tax_stack_from_rates,
     PropertyTaxPeriod,
     PropertyTaxSchedule,
     generate_property_tax_schedule,
-    analyze_tif,
-    TIFAnalysisResult,
-    # TIF Lump Sum
-    TIFLumpSumResult,
-    calculate_tif_lump_sum,
     # TIF as Loan
     TIFLoanPayment,
     TIFLoanSchedule,
@@ -102,13 +106,10 @@ __all__ = [
     "TaxingAuthority",
     "TaxingAuthorityStack",
     "get_austin_tax_stack",
+    "build_tax_stack_from_rates",
     "PropertyTaxPeriod",
     "PropertyTaxSchedule",
     "generate_property_tax_schedule",
-    "analyze_tif",
-    "TIFAnalysisResult",
-    "TIFLumpSumResult",
-    "calculate_tif_lump_sum",
     "TIFLoanPayment",
     "TIFLoanSchedule",
     "calculate_tif_loan_schedule",

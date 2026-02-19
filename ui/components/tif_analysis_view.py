@@ -15,8 +15,6 @@ from typing import Optional
 from src.calculations.property_tax import (
     TaxingAuthorityStack,
     get_austin_tax_stack,
-    TIFLumpSumResult,
-    calculate_tif_lump_sum,
     TIFLoanSchedule,
     calculate_tif_loan_schedule,
     solve_tif_term,

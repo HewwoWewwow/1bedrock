@@ -13,7 +13,6 @@ from src.calculations.detailed_cashflow import (
 from src.calculations.sources_uses import SourcesUses
 from src.calculations.property_tax import (
     TaxingAuthorityStack, get_austin_tax_stack,
-    TIFAnalysisResult, analyze_tif,
     PropertyTaxSchedule, PropertyTaxPeriod,
     generate_property_tax_schedule, calculate_assessed_value_schedule,
     AssessedValueTiming
@@ -119,31 +118,391 @@ def export_cashflow_to_csv(result: DetailedCashFlowResult) -> str:
     return output.getvalue()
 
 
-def render_sources_uses(sources_uses: SourcesUses) -> None:
-    """Render the Sources & Uses table."""
+def export_cashflow_to_excel(result: DetailedCashFlowResult, scenario_name: str = "Scenario") -> bytes:
+    """Export the detailed cash flow to Excel format for direct comparison.
+
+    Creates a comprehensive Excel workbook with:
+    - Summary sheet with key metrics
+    - Sources & Uses sheet
+    - Monthly cash flows sheet with all line items
+
+    Args:
+        result: The detailed cash flow result to export
+        scenario_name: Name of the scenario for the export
+
+    Returns:
+        Excel file as bytes that can be downloaded
+    """
+    import io
+    import pandas as pd
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
+    wb = Workbook()
+
+    # =========================================================================
+    # SHEET 1: SUMMARY
+    # =========================================================================
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+
+    # Header styles
+    header_font = Font(bold=True, size=12)
+    section_font = Font(bold=True, size=11, color="1565C0")
+    currency_fmt = '#,##0'
+    pct_fmt = '0.00%'
+
+    # Title
+    ws_summary['A1'] = f"{scenario_name} - Cash Flow Summary"
+    ws_summary['A1'].font = Font(bold=True, size=14)
+
+    # Key Metrics
+    row = 3
+    ws_summary[f'A{row}'] = "KEY METRICS"
+    ws_summary[f'A{row}'].font = section_font
+
+    metrics = [
+        ("Total Development Cost", result.sources_uses.tdc, currency_fmt),
+        ("Equity Required", result.sources_uses.equity, currency_fmt),
+        ("Construction Loan", result.sources_uses.construction_loan, currency_fmt),
+        ("Loan-to-Cost", result.sources_uses.ltc, pct_fmt),
+        ("", "", ""),
+        ("Unlevered IRR", result.unlevered_irr, pct_fmt),
+        ("Levered IRR", result.levered_irr, pct_fmt),
+        ("Total NOI", result.total_noi, currency_fmt),
+        ("Reversion Value", result.reversion_value, currency_fmt),
+    ]
+
+    row = 4
+    for label, value, fmt in metrics:
+        ws_summary[f'A{row}'] = label
+        if value != "":
+            ws_summary[f'B{row}'] = value
+            ws_summary[f'B{row}'].number_format = fmt
+        row += 1
+
+    # Phase Boundaries
+    row += 1
+    ws_summary[f'A{row}'] = "PHASE BOUNDARIES (Month)"
+    ws_summary[f'A{row}'].font = section_font
+    row += 1
+
+    phases = [
+        ("Predevelopment End", result.predevelopment_end),
+        ("Construction End", result.construction_end),
+        ("Lease-up End", result.leaseup_end),
+        ("Operations End", result.operations_end),
+        ("Total Periods", result.total_periods),
+    ]
+
+    for label, value in phases:
+        ws_summary[f'A{row}'] = label
+        ws_summary[f'B{row}'] = value
+        row += 1
+
+    # Adjust column widths
+    ws_summary.column_dimensions['A'].width = 25
+    ws_summary.column_dimensions['B'].width = 18
+
+    # =========================================================================
+    # SHEET 2: SOURCES & USES
+    # =========================================================================
+    ws_su = wb.create_sheet("Sources & Uses")
+
+    su = result.sources_uses
+
+    ws_su['A1'] = "USES OF FUNDS"
+    ws_su['A1'].font = section_font
+
+    uses = [
+        ("Land", su.land),
+        ("Hard Costs", su.hard_costs),
+        ("Soft Costs", su.soft_costs),
+        ("IDC (Interest During Construction)", su.idc),
+        ("TOTAL DEVELOPMENT COST", su.tdc),
+    ]
+
+    row = 2
+    for label, value in uses:
+        ws_su[f'A{row}'] = label
+        ws_su[f'B{row}'] = value
+        ws_su[f'B{row}'].number_format = currency_fmt
+        if "TOTAL" in label:
+            ws_su[f'A{row}'].font = Font(bold=True)
+            ws_su[f'B{row}'].font = Font(bold=True)
+        row += 1
+
+    row += 1
+    ws_su[f'A{row}'] = "SOURCES OF FUNDS"
+    ws_su[f'A{row}'].font = section_font
+    row += 1
+
+    sources = [
+        ("Equity", su.equity),
+        ("Construction Loan", su.construction_loan),
+        ("TOTAL SOURCES", su.total_sources),
+    ]
+
+    for label, value in sources:
+        ws_su[f'A{row}'] = label
+        ws_su[f'B{row}'] = value
+        ws_su[f'B{row}'].number_format = currency_fmt
+        if "TOTAL" in label:
+            ws_su[f'A{row}'].font = Font(bold=True)
+            ws_su[f'B{row}'].font = Font(bold=True)
+        row += 1
+
+    ws_su.column_dimensions['A'].width = 35
+    ws_su.column_dimensions['B'].width = 18
+
+    # =========================================================================
+    # SHEET 3: MONTHLY CASH FLOWS
+    # =========================================================================
+    ws_cf = wb.create_sheet("Monthly Cash Flows")
+
+    # Build header row
+    headers = [
+        "Period", "Phase",
+        # Development
+        "TDC Drawn", "Predev Drawn", "Construction Drawn",
+        # Equity
+        "Equity Drawn",
+        # Revenue
+        "GPR", "Vacancy", "EGI",
+        # Expenses
+        "OpEx (ex taxes)", "Property Taxes",
+        # TIF
+        "TIF Reimbursement", "TIF Abatement", "Net TIF Benefit",
+        # NOI
+        "NOI",
+        # Investment
+        "Dev Cost", "Reserves", "Reversion", "Unlevered CF",
+        # Construction Debt
+        "Const Debt Added", "Const Interest", "Const Repaid", "Const Net CF",
+        # Perm Debt
+        "Perm Payment", "Perm Interest", "Perm Principal", "Perm Payoff", "Perm Net CF",
+        # Final
+        "Net Debt CF", "Levered CF",
+    ]
+
+    for col, header in enumerate(headers, 1):
+        cell = ws_cf.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center', wrap_text=True)
+
+    # Build data rows
+    row = 2
+    for p in result.periods:
+        # Determine phase
+        if p.header.is_predevelopment:
+            phase = "Predev"
+        elif p.header.is_construction:
+            phase = "Construction"
+        elif p.header.is_leaseup:
+            phase = "Lease-up"
+        elif p.header.is_reversion:
+            phase = "Reversion"
+        elif p.header.is_operations:
+            phase = "Operations"
+        else:
+            phase = ""
+
+        # TIF data
+        tif_row = p.operations.tif
+        tif_reimb = tif_row.tif_reimbursement if tif_row else 0
+        tif_abate = tif_row.abatement_amount if tif_row else 0
+        tif_net = tif_row.net_tif_benefit if tif_row else 0
+
+        values = [
+            p.header.period,
+            phase,
+            # Development
+            p.development.draw_dollars_total,
+            p.development.draw_dollars_predev,
+            p.development.draw_dollars_construction,
+            # Equity
+            p.equity.equity_drawn,
+            # Revenue
+            p.operations.gpr,
+            p.operations.less_vacancy,
+            p.operations.egi,
+            # Expenses
+            p.operations.less_opex_ex_taxes,
+            p.operations.less_property_taxes,
+            # TIF
+            tif_reimb,
+            tif_abate,
+            tif_net,
+            # NOI
+            p.operations.noi,
+            # Investment
+            p.investment.dev_cost,
+            p.investment.reserves,
+            p.investment.reversion,
+            p.investment.unlevered_cf,
+            # Construction Debt
+            p.construction_debt.debt_added,
+            p.construction_debt.interest_in_period,
+            p.construction_debt.repaid,
+            p.construction_debt.net_cf,
+            # Perm Debt
+            p.permanent_debt.pmt_in_period,
+            p.permanent_debt.interest_pmt,
+            p.permanent_debt.principal_pmt,
+            p.permanent_debt.payoff,
+            p.permanent_debt.net_cf,
+            # Final
+            p.net_debt_cf,
+            p.levered_cf,
+        ]
+
+        for col, value in enumerate(values, 1):
+            cell = ws_cf.cell(row=row, column=col, value=value)
+            # Format numeric values
+            if col > 2 and isinstance(value, (int, float)):
+                cell.number_format = currency_fmt
+
+        row += 1
+
+    # Add totals row
+    total_row = row
+    ws_cf.cell(row=total_row, column=1, value="TOTAL").font = Font(bold=True)
+    ws_cf.cell(row=total_row, column=2, value="").font = Font(bold=True)
+
+    # Calculate totals for each numeric column
+    for col in range(3, len(headers) + 1):
+        total = sum(
+            ws_cf.cell(row=r, column=col).value or 0
+            for r in range(2, total_row)
+        )
+        cell = ws_cf.cell(row=total_row, column=col, value=total)
+        cell.font = Font(bold=True)
+        cell.number_format = currency_fmt
+
+    # Freeze header row and first two columns
+    ws_cf.freeze_panes = 'C2'
+
+    # Adjust column widths
+    for col in range(1, len(headers) + 1):
+        ws_cf.column_dimensions[ws_cf.cell(row=1, column=col).column_letter].width = 14
+
+    # =========================================================================
+    # SHEET 4: ANNUAL SUMMARY
+    # =========================================================================
+    ws_annual = wb.create_sheet("Annual Summary")
+
+    # Group periods by year
+    years_data = {}
+    for p in result.periods:
+        year = (p.header.period - 1) // 12 + 1
+        if year not in years_data:
+            years_data[year] = []
+        years_data[year].append(p)
+
+    annual_headers = [
+        "Year", "Periods",
+        "GPR", "Vacancy", "EGI",
+        "OpEx", "Prop Taxes", "NOI",
+        "TIF Benefit",
+        "Debt Service", "Levered CF",
+    ]
+
+    for col, header in enumerate(annual_headers, 1):
+        cell = ws_annual.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True)
+
+    row = 2
+    for year in sorted(years_data.keys()):
+        periods = years_data[year]
+        period_range = f"{periods[0].header.period}-{periods[-1].header.period}"
+
+        tif_benefit = sum(
+            (p.operations.tif.net_tif_benefit if p.operations.tif else 0)
+            for p in periods
+        )
+
+        values = [
+            year,
+            period_range,
+            sum(p.operations.gpr for p in periods),
+            sum(p.operations.less_vacancy for p in periods),
+            sum(p.operations.egi for p in periods),
+            sum(p.operations.less_opex_ex_taxes for p in periods),
+            sum(p.operations.less_property_taxes for p in periods),
+            sum(p.operations.noi for p in periods),
+            tif_benefit,
+            sum(p.permanent_debt.pmt_in_period for p in periods),
+            sum(p.levered_cf for p in periods),
+        ]
+
+        for col, value in enumerate(values, 1):
+            cell = ws_annual.cell(row=row, column=col, value=value)
+            if col > 2 and isinstance(value, (int, float)):
+                cell.number_format = currency_fmt
+
+        row += 1
+
+    # Adjust column widths
+    ws_annual.column_dimensions['A'].width = 8
+    ws_annual.column_dimensions['B'].width = 12
+    for col in range(3, len(annual_headers) + 1):
+        ws_annual.column_dimensions[ws_annual.cell(row=1, column=col).column_letter].width = 14
+
+    # Save to bytes
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+def render_sources_uses(
+    sources_uses: SourcesUses,
+    show_detail_toggle: bool = True,
+    key_prefix: str = "",
+) -> None:
+    """Render the Sources & Uses table.
+
+    Args:
+        sources_uses: The SourcesUses object with capital stack data
+        show_detail_toggle: Whether to show the detail toggle (default True)
+        key_prefix: Prefix for widget keys to avoid duplicates
+    """
     st.subheader("Sources & Uses")
+
+    # Detail toggle
+    show_detail = False
+    if show_detail_toggle:
+        toggle_key = f"{key_prefix}_su_detail_toggle" if key_prefix else "su_detail_toggle"
+        show_detail = st.checkbox("Show detailed breakdown", value=False, key=toggle_key)
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("**USES**")
-        uses_data = {
-            "Category": ["Land", "Hard Costs", "Soft Costs", "IDC", "**Total Development Cost**"],
-            "Amount": [
-                f"${sources_uses.land:,.0f}",
-                f"${sources_uses.hard_costs:,.0f}",
-                f"${sources_uses.soft_costs:,.0f}",
-                f"${sources_uses.idc:,.0f}",
-                f"**${sources_uses.tdc:,.0f}**",
-            ],
-            "% of TDC": [
-                f"{sources_uses.land / sources_uses.tdc:.1%}",
-                f"{sources_uses.hard_costs / sources_uses.tdc:.1%}",
-                f"{sources_uses.soft_costs / sources_uses.tdc:.1%}",
-                f"{sources_uses.idc / sources_uses.tdc:.1%}",
-                "100.0%",
-            ],
-        }
+
+        if show_detail and _has_detailed_breakdown(sources_uses):
+            # Detailed breakdown
+            uses_data = _build_detailed_uses_data(sources_uses)
+        else:
+            # Summary view
+            uses_data = {
+                "Category": ["Land", "Hard Costs", "Soft Costs", "IDC", "**Total Development Cost**"],
+                "Amount": [
+                    f"${sources_uses.land:,.0f}",
+                    f"${sources_uses.hard_costs:,.0f}",
+                    f"${sources_uses.soft_costs:,.0f}",
+                    f"${sources_uses.idc:,.0f}",
+                    f"**${sources_uses.tdc:,.0f}**",
+                ],
+                "% of TDC": [
+                    f"{sources_uses.land / sources_uses.tdc:.1%}",
+                    f"{sources_uses.hard_costs / sources_uses.tdc:.1%}",
+                    f"{sources_uses.soft_costs / sources_uses.tdc:.1%}",
+                    f"{sources_uses.idc / sources_uses.tdc:.1%}",
+                    "100.0%",
+                ],
+            }
         st.dataframe(pd.DataFrame(uses_data), use_container_width=True, hide_index=True)
 
     with col2:
@@ -162,6 +521,104 @@ def render_sources_uses(sources_uses: SourcesUses) -> None:
             ],
         }
         st.dataframe(pd.DataFrame(sources_data), use_container_width=True, hide_index=True)
+
+
+def _has_detailed_breakdown(sources_uses: SourcesUses) -> bool:
+    """Check if the SourcesUses has any detailed breakdown values populated."""
+    return (
+        sources_uses.hard_cost_contingency > 0 or
+        sources_uses.soft_cost_contingency > 0 or
+        sources_uses.predevelopment_costs > 0 or
+        sources_uses.developer_fee > 0 or
+        sources_uses.reserves > 0
+    )
+
+
+def _build_detailed_uses_data(sources_uses: SourcesUses) -> dict:
+    """Build the detailed uses breakdown table data."""
+    su = sources_uses
+
+    # Calculate base costs from totals minus contingencies
+    hard_costs_base = su.hard_costs - su.hard_cost_contingency
+
+    # Soft costs breakdown: total soft_costs includes base + contingency + predev + dev fee
+    # soft_costs field = hard_costs * effective_soft_cost_pct (the combined %)
+    # We have individual values for contingency, predev, dev fee
+    # So base soft = soft_costs - soft_cost_contingency - predevelopment_costs - developer_fee
+    soft_costs_base = su.soft_costs - su.soft_cost_contingency - su.predevelopment_costs - su.developer_fee - su.reserves
+    if soft_costs_base < 0:
+        soft_costs_base = 0  # Guard against calculation issues
+
+    categories = []
+    amounts = []
+    pct_tdc = []
+
+    # Land
+    categories.append("Land")
+    amounts.append(f"${su.land:,.0f}")
+    pct_tdc.append(f"{su.land / su.tdc:.1%}")
+
+    # Hard Costs - Base
+    categories.append("Hard Costs (Base)")
+    amounts.append(f"${hard_costs_base:,.0f}")
+    pct_tdc.append(f"{hard_costs_base / su.tdc:.1%}")
+
+    # Hard Costs - Contingency
+    if su.hard_cost_contingency > 0:
+        categories.append("  + Contingency")
+        amounts.append(f"${su.hard_cost_contingency:,.0f}")
+        pct_tdc.append(f"{su.hard_cost_contingency / su.tdc:.1%}")
+
+    # Soft Costs - Base
+    categories.append("Soft Costs (Base)")
+    amounts.append(f"${soft_costs_base:,.0f}")
+    pct_tdc.append(f"{soft_costs_base / su.tdc:.1%}")
+
+    # Soft Costs - Contingency
+    if su.soft_cost_contingency > 0:
+        categories.append("  + Contingency")
+        amounts.append(f"${su.soft_cost_contingency:,.0f}")
+        pct_tdc.append(f"{su.soft_cost_contingency / su.tdc:.1%}")
+
+    # Predevelopment Costs
+    if su.predevelopment_costs > 0:
+        categories.append("Predevelopment Costs")
+        amounts.append(f"${su.predevelopment_costs:,.0f}")
+        pct_tdc.append(f"{su.predevelopment_costs / su.tdc:.1%}")
+
+    # Developer Fee
+    if su.developer_fee > 0:
+        categories.append("Developer Fee")
+        amounts.append(f"${su.developer_fee:,.0f}")
+        pct_tdc.append(f"{su.developer_fee / su.tdc:.1%}")
+
+    # Reserves
+    if su.reserves > 0:
+        categories.append("Reserves")
+        amounts.append(f"${su.reserves:,.0f}")
+        pct_tdc.append(f"{su.reserves / su.tdc:.1%}")
+
+    # Loan Fee
+    if su.loan_fee > 0:
+        categories.append("Loan Fee")
+        amounts.append(f"${su.loan_fee:,.0f}")
+        pct_tdc.append(f"{su.loan_fee / su.tdc:.1%}")
+
+    # IDC
+    categories.append("Interest During Construction")
+    amounts.append(f"${su.idc:,.0f}")
+    pct_tdc.append(f"{su.idc / su.tdc:.1%}")
+
+    # Total
+    categories.append("**Total Development Cost**")
+    amounts.append(f"**${su.tdc:,.0f}**")
+    pct_tdc.append("100.0%")
+
+    return {
+        "Category": categories,
+        "Amount": amounts,
+        "% of TDC": pct_tdc,
+    }
 
 
 @dataclass
@@ -419,11 +876,19 @@ def _fmt_pct(val: float) -> str:
 def render_detailed_cashflow_table(
     result: DetailedCashFlowResult,
     aggregation: Literal["monthly", "quarterly", "annual"] = "monthly",
+    is_mixed_income: bool = False,
+    tif_lump_sum: float = 0.0,
 ) -> None:
     """Render the detailed cash flow table with sticky columns.
 
     Shows all rows from the Excel model structure with horizontal scrolling
     and sticky first three columns (Section, Row, Total).
+
+    Args:
+        result: The detailed cash flow result
+        aggregation: How to aggregate periods (monthly, quarterly, annual)
+        is_mixed_income: If True, show mixed income GPR breakdown; if False, show all-market GPR
+        tif_lump_sum: TIF lump sum amount (shown as source for mixed income)
     """
     st.subheader("Detailed Cash Flows")
 
@@ -567,21 +1032,42 @@ def render_detailed_cashflow_table(
             [_fmt_currency(p.equity_drawn) for p in visible_periods],
             sum(p.equity_drawn for p in all_periods))
 
+    # TIF Lump Sum (for mixed income with TIF enabled)
+    # TIF draws alongside equity during predevelopment/construction
+    if is_mixed_income and tif_lump_sum > 0:
+        # Calculate TIF draw schedule - same pattern as equity
+        # TIF is drawn pro-rata with equity during the same periods
+        total_equity = sum(p.equity_drawn for p in all_periods)
+        if total_equity > 0:
+            tif_draws = []
+            for p in visible_periods:
+                # TIF draws proportionally to equity
+                equity_pct = p.equity_drawn / total_equity if total_equity > 0 else 0
+                tif_draw = tif_lump_sum * equity_pct
+                tif_draws.append(_fmt_currency(tif_draw))
+            add_row("TIF", "TIF Lump Sum Drawn",
+                    tif_draws,
+                    tif_lump_sum)
+
     # Debt sources section
     add_row("Debt", "Debt Financed",
             [_fmt_currency(p.debt_financed) for p in visible_periods],
             sum(p.debt_financed for p in all_periods))
 
-    # GPR section
-    add_row("GPR", "GPR - All Market",
-            [_fmt_currency(p.gpr_all_market) for p in visible_periods],
-            sum(p.gpr_all_market for p in all_periods))
-    add_row("", "GPR - Mixed (Market)",
-            [_fmt_currency(p.gpr_mixed_market) for p in visible_periods],
-            sum(p.gpr_mixed_market for p in all_periods))
-    add_row("", "GPR - Mixed (Affordable)",
-            [_fmt_currency(p.gpr_mixed_affordable) for p in visible_periods],
-            sum(p.gpr_mixed_affordable for p in all_periods))
+    # GPR section - show appropriate breakdown based on scenario
+    if is_mixed_income:
+        # Mixed income: show market units and affordable units GPR
+        add_row("GPR", "GPR - Market Units",
+                [_fmt_currency(p.gpr_mixed_market) for p in visible_periods],
+                sum(p.gpr_mixed_market for p in all_periods))
+        add_row("", "GPR - Affordable Units",
+                [_fmt_currency(p.gpr_mixed_affordable) for p in visible_periods],
+                sum(p.gpr_mixed_affordable for p in all_periods))
+    else:
+        # Market rate: show all-market GPR only
+        add_row("GPR", "GPR - All Market",
+                [_fmt_currency(p.gpr_all_market) for p in visible_periods],
+                sum(p.gpr_all_market for p in all_periods))
 
     # Operations section
     add_row("Operations", "GPR",

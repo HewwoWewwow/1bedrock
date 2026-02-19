@@ -123,10 +123,11 @@ ABATEMENT_TERMS: Dict[IncentiveTier, AbatementTerms] = {
 }
 
 # TIF parameters by tier (from spec)
+# Cap rate of 9.5% used for capitalizing TIF lump sum value
 TIF_PARAMS: Dict[IncentiveTier, TIFParams] = {
-    IncentiveTier.TIER_1: TIFParams(term_years=20, rate=0.00, cap_rate=0.065),
-    IncentiveTier.TIER_2: TIFParams(term_years=15, rate=0.02, cap_rate=0.065),
-    IncentiveTier.TIER_3: TIFParams(term_years=10, rate=0.04, cap_rate=0.075),
+    IncentiveTier.TIER_1: TIFParams(term_years=20, rate=0.00, cap_rate=0.095),
+    IncentiveTier.TIER_2: TIFParams(term_years=15, rate=0.02, cap_rate=0.095),
+    IncentiveTier.TIER_3: TIFParams(term_years=10, rate=0.04, cap_rate=0.095),
 }
 
 # Interest rate buydown by tier (from spec)

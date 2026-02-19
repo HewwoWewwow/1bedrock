@@ -1,4 +1,7 @@
-"""Scenario matrix runner for comparing incentive combinations."""
+"""Scenario matrix runner for comparing incentive combinations.
+
+Uses the unified calculation engine (calculate_deal) for consistency.
+"""
 
 from dataclasses import dataclass
 from itertools import product
@@ -11,11 +14,11 @@ from .models.incentives import (
     IncentiveToggles,
     get_tier_config,
 )
-from .calculations.dcf import run_dcf
+from .calculations.detailed_cashflow import calculate_deal  # SINGLE SOURCE OF TRUTH
 from .calculations.units import allocate_units, get_total_units, get_total_affordable_units
 from .calculations.revenue import calculate_gpr
 from .calculations.metrics import (
-    calculate_metrics,
+    calculate_metrics_from_detailed,  # Unified version
     compare_scenarios,
     ScenarioMetrics,
     ScenarioComparison,
@@ -129,6 +132,9 @@ def run_single_scenario(
 ) -> tuple[ScenarioMetrics, float]:
     """Run a single scenario and return metrics.
 
+    Uses the unified calculation engine (calculate_deal) for consistency.
+    This is the SINGLE SOURCE OF TRUTH for all cash flow calculations.
+
     Args:
         inputs: Project inputs.
         scenario: MARKET or MIXED_INCOME.
@@ -136,8 +142,8 @@ def run_single_scenario(
     Returns:
         Tuple of (ScenarioMetrics, annual GPR).
     """
-    # Run DCF
-    dcf_result = run_dcf(inputs, scenario)
+    # Run unified calculation engine (SINGLE SOURCE OF TRUTH)
+    result = calculate_deal(inputs, scenario)
 
     # Get unit counts
     affordable_pct = inputs.affordable_pct if scenario == Scenario.MIXED_INCOME else 0.0
@@ -154,9 +160,10 @@ def run_single_scenario(
     # Get GPR
     gpr_result = calculate_gpr(allocations)
 
-    # Calculate metrics
-    metrics = calculate_metrics(
-        dcf_result=dcf_result,
+    # Calculate metrics from detailed result
+    metrics = calculate_metrics_from_detailed(
+        result=result,
+        scenario=scenario,
         total_units=total_units,
         affordable_units=affordable_units,
         gpr_annual=gpr_result.total_gpr_annual,

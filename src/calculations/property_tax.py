@@ -100,6 +100,43 @@ def get_austin_tax_stack() -> TaxingAuthorityStack:
     )
 
 
+def build_tax_stack_from_rates(tax_rates: Dict[str, float]) -> TaxingAuthorityStack:
+    """Build a TaxingAuthorityStack from a tax_rates dictionary.
+
+    The tax_rates dictionary uses simple keys ("city", "county", "isd", "hospital", "acc")
+    which map to the Austin taxing authorities. Only "city" participates in TIF.
+
+    Args:
+        tax_rates: Dictionary with keys "city", "county", "isd", "hospital", "acc"
+                   and values as rate per $100 of assessed value.
+
+    Returns:
+        TaxingAuthorityStack with authorities matching the provided rates.
+    """
+    # Map simple keys to authority names and codes
+    authority_mapping = {
+        "city": ("City of Austin", "COA", True),  # Only city participates in TIF
+        "county": ("Travis County", "TC", False),
+        "isd": ("Austin ISD", "AISD", False),
+        "hospital": ("Central Health", "CH", False),
+        "acc": ("Austin Community College", "ACC", False),
+    }
+
+    authorities = []
+    for key, rate in tax_rates.items():
+        if key in authority_mapping:
+            name, code, participates_in_tif = authority_mapping[key]
+            authorities.append(
+                TaxingAuthority(name, code, rate, participates_in_tif=participates_in_tif)
+            )
+
+    # If no authorities found, return default Austin stack
+    if not authorities:
+        return get_austin_tax_stack()
+
+    return TaxingAuthorityStack(authorities=authorities)
+
+
 @dataclass
 class PropertyTaxPeriod:
     """Property tax calculation for a single period.
@@ -335,199 +372,6 @@ def generate_property_tax_schedule(
         npv_increment_nominal=npv_increment_nominal,
         npv_increment_real=npv_increment_real,
         discount_rate=discount_rate,
-    )
-
-
-@dataclass
-class TIFAnalysisResult:
-    """Summary of TIF analysis for a development.
-
-    Provides key metrics for evaluating TIF value.
-    """
-    # Baseline info
-    baseline_assessed_value: float
-    stabilized_assessed_value: float
-    increment_assessed_value: float
-
-    # Tax rates
-    total_tax_rate: float
-    tif_participating_rate: float
-    non_tif_rate: float
-
-    # Participating authorities
-    participating_authorities: List[str]
-
-    # Annual increment (at stabilization)
-    annual_increment_tax_nominal: float
-    annual_increment_tax_real: float
-
-    # Present values (over analysis period)
-    npv_increment_nominal: float
-    npv_increment_real: float
-
-    # TIF term info
-    tif_term_years: int
-    discount_rate: float
-
-
-def analyze_tif(
-    tax_stack: TaxingAuthorityStack,
-    baseline_assessed_value: float,
-    stabilized_assessed_value: float,
-    tif_term_years: int = 20,
-    discount_rate: float = 0.06,
-    inflation_rate: float = 0.02,
-    assessment_growth_rate: float = 0.02,
-) -> TIFAnalysisResult:
-    """Analyze TIF value for a development.
-
-    Calculates the present value of the TIF increment stream
-    over the specified term.
-
-    Args:
-        tax_stack: Taxing authority stack
-        baseline_assessed_value: Frozen baseline assessed value
-        stabilized_assessed_value: Assessed value at stabilization
-        tif_term_years: Number of years for TIF term
-        discount_rate: Annual discount rate for NPV
-        inflation_rate: Annual inflation rate
-        assessment_growth_rate: Annual growth rate for assessed value
-
-    Returns:
-        TIFAnalysisResult with NPV calculations
-    """
-    increment_value = max(0, stabilized_assessed_value - baseline_assessed_value)
-
-    # Annual increment tax at stabilization
-    annual_increment_nominal = increment_value * tax_stack.tif_participating_rate_decimal
-
-    # Calculate NPV of increment stream
-    # Assuming annual payments, growing at assessment growth rate
-    npv_nominal = 0.0
-    npv_real = 0.0
-
-    for year in range(1, tif_term_years + 1):
-        # Increment grows with assessment
-        year_increment = annual_increment_nominal * ((1 + assessment_growth_rate) ** (year - 1))
-
-        # Discount to present
-        discount_factor = 1 / ((1 + discount_rate) ** year)
-        npv_nominal += year_increment * discount_factor
-
-        # Real value (deflate by inflation)
-        inflation_factor = (1 + inflation_rate) ** year
-        real_increment = year_increment / inflation_factor
-        npv_real += real_increment * discount_factor
-
-    # Get participating authorities
-    participating = [a.name for a in tax_stack.authorities if a.participates_in_tif]
-
-    # Real annual increment (deflated by one year of inflation)
-    annual_increment_real = annual_increment_nominal / (1 + inflation_rate)
-
-    return TIFAnalysisResult(
-        baseline_assessed_value=baseline_assessed_value,
-        stabilized_assessed_value=stabilized_assessed_value,
-        increment_assessed_value=increment_value,
-        total_tax_rate=tax_stack.total_rate_decimal,
-        tif_participating_rate=tax_stack.tif_participating_rate_decimal,
-        non_tif_rate=tax_stack.non_tif_rate_per_100 / 100,
-        participating_authorities=participating,
-        annual_increment_tax_nominal=annual_increment_nominal,
-        annual_increment_tax_real=annual_increment_real,
-        npv_increment_nominal=npv_nominal,
-        npv_increment_real=npv_real,
-        tif_term_years=tif_term_years,
-        discount_rate=discount_rate,
-    )
-
-
-# ============================================================================
-# TIF Lump Sum Calculation
-# ============================================================================
-
-@dataclass
-class TIFLumpSumResult:
-    """Result of TIF lump sum calculation."""
-    # Input values
-    noi_delta: float  # Difference in NOI between scenarios
-    cap_rate: float
-    discount_rate: float
-    annual_increment: float
-    term_years: int
-
-    # Calculated values
-    capitalized_value_noi_method: float  # NOI delta / cap rate
-    pv_of_increment_stream: float  # PV of increment payments
-    recommended_lump_sum: float  # Selected method result
-
-    # Per-unit metrics
-    affordable_units: int
-    per_affordable_unit: float
-    as_pct_of_tdc: float
-
-
-def calculate_tif_lump_sum(
-    noi_delta: float,
-    cap_rate: float,
-    discount_rate: float,
-    annual_increment: float,
-    term_years: int,
-    tdc: float,
-    affordable_units: int,
-    use_noi_method: bool = True,
-    escalation_rate: float = 0.015,
-) -> TIFLumpSumResult:
-    """Calculate TIF lump sum value.
-
-    Two methods:
-    1. NOI Method: NOI delta / cap rate (capitalizes income gap)
-    2. PV Method: PV of escalating increment stream
-
-    Args:
-        noi_delta: Annual NOI difference (market NOI - affordable NOI)
-        cap_rate: Capitalization rate for NOI method
-        discount_rate: Discount rate for PV method
-        annual_increment: Annual tax increment from participating entities
-        term_years: TIF term in years
-        tdc: Total development cost (for % calculation)
-        affordable_units: Number of affordable units
-        use_noi_method: If True, recommend NOI method; else PV method
-        escalation_rate: Annual escalation of increment (e.g., 1.5%)
-
-    Returns:
-        TIFLumpSumResult with both methods calculated
-    """
-    # Method 1: NOI capitalization
-    cap_value_noi = noi_delta / cap_rate if cap_rate > 0 else 0.0
-
-    # Method 2: PV of escalating increment stream
-    # PV = sum of (increment * (1+escalation)^t / (1+discount)^t)
-    pv_stream = 0.0
-    for year in range(1, term_years + 1):
-        escalated_increment = annual_increment * ((1 + escalation_rate) ** year)
-        pv_factor = 1 / ((1 + discount_rate) ** year)
-        pv_stream += escalated_increment * pv_factor
-
-    # Select method
-    recommended = cap_value_noi if use_noi_method else pv_stream
-
-    # Per-unit metrics
-    per_unit = recommended / affordable_units if affordable_units > 0 else 0.0
-    pct_of_tdc = recommended / tdc if tdc > 0 else 0.0
-
-    return TIFLumpSumResult(
-        noi_delta=noi_delta,
-        cap_rate=cap_rate,
-        discount_rate=discount_rate,
-        annual_increment=annual_increment,
-        term_years=term_years,
-        capitalized_value_noi_method=cap_value_noi,
-        pv_of_increment_stream=pv_stream,
-        recommended_lump_sum=recommended,
-        affordable_units=affordable_units,
-        per_affordable_unit=per_unit,
-        as_pct_of_tdc=pct_of_tdc,
     )
 
 

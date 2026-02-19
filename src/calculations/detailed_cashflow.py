@@ -26,7 +26,14 @@ class AssessedValueBasis(str, Enum):
     NOI = "noi"  # Capitalized NOI (income approach)
 
 from src.calculations.sources_uses import SourcesUses, calculate_sources_uses
-from src.calculations.debt import calculate_interest_portion, calculate_principal_portion
+from src.calculations.debt import (
+    calculate_interest_portion,
+    calculate_principal_portion,
+    size_permanent_loan,
+)
+from src.calculations.units import allocate_units, get_total_units, get_total_affordable_units
+from src.calculations.revenue import calculate_gpr
+from src.models.project import ProjectInputs, Scenario, TIFStartTiming
 from src.calculations.draw_schedule import (
     DrawSchedule, PeriodDraw, Phase,
     generate_draw_schedule_from_sources_uses
@@ -34,7 +41,7 @@ from src.calculations.draw_schedule import (
 from src.calculations.property_tax import (
     TaxingAuthorityStack, PropertyTaxSchedule,
     calculate_assessed_value_schedule, generate_property_tax_schedule,
-    get_austin_tax_stack, AssessedValueTiming
+    get_austin_tax_stack, build_tax_stack_from_rates, AssessedValueTiming
 )
 
 
@@ -151,6 +158,7 @@ class OperationsRow:
     vacancy_rate: float
     less_vacancy: float
     egi: float  # Effective Gross Income
+    less_management_fee: float  # Management fee as % of EGI
     less_opex_ex_taxes: float
     less_property_taxes: float
     noi: float
@@ -353,11 +361,15 @@ def generate_detailed_cash_flow(
     start_date: date,
     predevelopment_months: int,
     construction_months: int,
+    idc_leaseup_months: int,  # Additional IDC months during lease-up
     leaseup_months: int,
     operations_months: int,
 
-    # Revenue inputs
-    monthly_gpr_at_stabilization: float,
+    # Revenue inputs - GPR from proper unit allocation calculations
+    # These values come from allocate_units() + calculate_gpr() in the caller
+    market_gpr_monthly: float,           # Total monthly GPR from market-rate units
+    affordable_gpr_monthly: float,       # Total monthly GPR from affordable units (at AMI rents)
+    all_market_gpr_monthly: float,       # GPR if ALL units were at market rents (for comparison)
     vacancy_rate: float,
     leaseup_pace: float,  # Monthly absorption rate
     max_occupancy: float,
@@ -368,6 +380,16 @@ def generate_detailed_cash_flow(
 
     # Property tax inputs
     existing_assessed_value: float,
+
+    # === Parameters with defaults below ===
+    # Management fee
+    management_fee_pct: float = 0.05,  # Management fee as % of EGI
+
+    # Reserve inputs (added to TDC)
+    operating_reserve_months: int = 3,  # Months of OpEx in reserve
+    leaseup_reserve_months: int = 6,  # Months of leaseup deficit in reserve
+
+    # Property tax options
     tax_stack: Optional[TaxingAuthorityStack] = None,
     assessment_growth_rate: float = 0.02,
     assessed_value_basis: AssessedValueBasis = AssessedValueBasis.TDC,  # TDC or NOI-based
@@ -388,6 +410,8 @@ def generate_detailed_cash_flow(
     # Exit inputs
     exit_cap_rate: float = 0.055,
     reserves_pct: float = 0.005,  # % of EGI
+    selling_costs_pct: float = 0.02,  # Selling costs as % of sale price
+    reversion_noi_basis: str = "forward",  # "forward" or "trailing" - which NOI to use for exit cap
 
     # IRR calculation options
     exclude_land_from_irr: bool = True,  # Land is recovered at sale, not a "cost"
@@ -398,13 +422,13 @@ def generate_detailed_cash_flow(
 
     # Mixed income inputs (optional)
     affordable_pct: float = 0.0,
-    affordable_rent_discount: float = 0.0,  # As decimal (e.g., 0.40 = 40% discount)
     affordable_rent_growth: float = 0.01,
 
     # Mezzanine debt inputs (optional)
     mezzanine_amount: float = 0.0,
     mezzanine_rate: float = 0.12,  # 12% default
     mezzanine_io: bool = True,  # Interest-only
+    mezzanine_amort_years: int = 10,  # Amortization term if not IO
 
     # Preferred equity inputs (optional)
     preferred_amount: float = 0.0,
@@ -418,6 +442,12 @@ def generate_detailed_cash_flow(
     tif_stream_pct: float = 0.0,  # % of city increment reimbursed (0-1.0)
     tif_stream_years: int = 0,  # Years of stream
     tif_start_delay_months: int = 0,  # Delay from stabilization to TIF start
+    # Detailed breakdown for display (optional)
+    hard_cost_contingency: float = 0.0,
+    soft_cost_contingency: float = 0.0,
+    predevelopment_costs: float = 0.0,
+    developer_fee: float = 0.0,
+    loan_fee: float = 0.0,
 ) -> DetailedCashFlowResult:
     """Generate detailed cash flow for a development.
 
@@ -427,8 +457,8 @@ def generate_detailed_cash_flow(
     if tax_stack is None:
         tax_stack = get_austin_tax_stack()
 
-    # Calculate sources & uses
-    sources_uses = calculate_sources_uses(
+    # Calculate base sources & uses (before reserves)
+    sources_uses_base = calculate_sources_uses(
         land_cost=land_cost,
         hard_costs=hard_costs,
         soft_cost_pct=soft_cost_pct,
@@ -436,7 +466,49 @@ def generate_detailed_cash_flow(
         construction_rate=construction_rate,
         construction_months=construction_months,
         predevelopment_months=predevelopment_months,
+        leaseup_months=leaseup_months,
     )
+
+    # Calculate reserves to add to TDC
+    # Operating reserve: X months of stabilized operating expenses
+    monthly_opex_estimate = (annual_opex_per_unit * total_units) / 12
+    operating_reserve = monthly_opex_estimate * operating_reserve_months
+
+    # Leaseup reserve: X months of projected deficit during leaseup
+    # Calculate average occupancy from actual leaseup pace instead of hardcoded 0.5
+    total_gpr_monthly_estimate = market_gpr_monthly + affordable_gpr_monthly
+    # Linear lease-up: starts at 0, ends at min(leaseup_pace * leaseup_months, max_occupancy)
+    final_leaseup_occupancy = min(leaseup_pace * leaseup_months, max_occupancy)
+    avg_leaseup_occupancy = final_leaseup_occupancy / 2  # Average of linear ramp from 0 to final
+    avg_leaseup_egi = total_gpr_monthly_estimate * avg_leaseup_occupancy
+    avg_leaseup_deficit = max(0, monthly_opex_estimate - avg_leaseup_egi)
+    leaseup_reserve = avg_leaseup_deficit * leaseup_reserve_months
+
+    total_reserves = operating_reserve + leaseup_reserve
+
+    # Recalculate sources & uses with reserves added to soft costs
+    # Reserves are typically funded through equity, so add to soft cost equivalent
+    reserve_as_soft_pct = total_reserves / hard_costs if hard_costs > 0 else 0
+    effective_soft_cost_pct = soft_cost_pct + reserve_as_soft_pct
+
+    sources_uses = calculate_sources_uses(
+        land_cost=land_cost,
+        hard_costs=hard_costs,
+        soft_cost_pct=effective_soft_cost_pct,
+        construction_ltc=construction_ltc,
+        construction_rate=construction_rate,
+        construction_months=construction_months,
+        predevelopment_months=predevelopment_months,
+        leaseup_months=leaseup_months,
+    )
+
+    # Store detailed breakdown values (for display) and reserves
+    sources_uses.hard_cost_contingency = hard_cost_contingency
+    sources_uses.soft_cost_contingency = soft_cost_contingency
+    sources_uses.predevelopment_costs = predevelopment_costs
+    sources_uses.developer_fee = developer_fee
+    sources_uses.loan_fee = loan_fee
+    sources_uses.reserves = total_reserves
 
     # TIF lump sum reduces equity requirement (front-loaded incentive)
     # The TIF is treated as an additional source of funds that offsets equity
@@ -444,12 +516,13 @@ def generate_detailed_cash_flow(
     if tif_treatment == "lump_sum" and tif_lump_sum > 0:
         tif_lump_sum_applied = min(tif_lump_sum, sources_uses.equity)  # Can't exceed equity
 
-    # Generate draw schedule
+    # Generate draw schedule (includes lease-up for construction loan interest)
     draw_schedule = generate_draw_schedule_from_sources_uses(
         sources_uses=sources_uses,
         predevelopment_months=predevelopment_months,
         construction_months=construction_months,
         construction_rate=construction_rate,
+        leaseup_months=leaseup_months,
     )
 
     # Calculate phase boundaries
@@ -469,8 +542,14 @@ def generate_detailed_cash_flow(
         assessment_base = sources_uses.tdc
     else:
         # Use capitalized NOI (income approach)
-        annual_noi_rough = monthly_gpr_at_stabilization * 12 * (1 - vacancy_rate) * 0.60  # Rough NOI margin
-        assessment_base = annual_noi_rough / exit_cap_rate
+        # Calculate NOI using actual inputs instead of rough 60% margin
+        total_gpr_for_noi = market_gpr_monthly + affordable_gpr_monthly
+        stabilized_egi_monthly = total_gpr_for_noi * (1 - vacancy_rate)
+        monthly_opex = (annual_opex_per_unit * total_units) / 12
+        monthly_mgmt = stabilized_egi_monthly * management_fee_pct
+        # For initial assessment, exclude property taxes (they're circular with assessed value)
+        annual_noi = (stabilized_egi_monthly - monthly_opex - monthly_mgmt) * 12
+        assessment_base = annual_noi / exit_cap_rate
 
     # Calculate assessed values
     assessed_values = calculate_assessed_value_schedule(
@@ -484,45 +563,36 @@ def generate_detailed_cash_flow(
         assessment_growth_rate=assessment_growth_rate,
     )
 
-    # Size permanent loan at stabilization
+    # Size permanent loan at stabilization using the canonical debt.py function
     # For loan sizing, always use income approach (what lenders use)
-    # Stabilized NOI calculation - account for mixed-income unit mix
-    market_portion = 1 - affordable_pct
-    affordable_portion = affordable_pct
-    affordable_rent = monthly_gpr_at_stabilization * (1 - affordable_rent_discount)
+    # Stabilized NOI calculation using proper GPR values from unit allocations
+    total_gpr_monthly = market_gpr_monthly + affordable_gpr_monthly
 
-    # Blended GPR for mixed-income scenario
-    blended_gpr = (monthly_gpr_at_stabilization * market_portion) + (affordable_rent * affordable_portion)
-
-    stabilized_gpr = blended_gpr * (1 - vacancy_rate)
+    stabilized_gpr = total_gpr_monthly * (1 - vacancy_rate)
     stabilized_egi = stabilized_gpr
     stabilized_monthly_opex = (annual_opex_per_unit * total_units) / 12
+    stabilized_monthly_mgmt_fee = stabilized_egi * management_fee_pct  # Management fee as % of EGI
     stabilized_monthly_taxes = assessment_base * tax_stack.total_rate_decimal / 12
-    stabilized_monthly_noi = stabilized_egi - stabilized_monthly_opex - stabilized_monthly_taxes
+    stabilized_monthly_noi = stabilized_egi - stabilized_monthly_opex - stabilized_monthly_mgmt_fee - stabilized_monthly_taxes
     stabilized_annual_noi = stabilized_monthly_noi * 12
 
     # Property value for LTV (always income approach for lenders)
     property_value_for_ltv = stabilized_annual_noi / exit_cap_rate
 
-    # LTV constraint
-    ltv_loan = property_value_for_ltv * perm_ltv_max
-
-    # DSCR constraint
-    annual_debt_service_max = stabilized_annual_noi / perm_dscr_min
-    monthly_rate = perm_rate / 12
-    n_payments = perm_amort_years * 12
-    if monthly_rate > 0 and n_payments > 0:
-        dscr_loan = annual_debt_service_max / 12 * \
-                    ((1 + monthly_rate) ** n_payments - 1) / \
-                    (monthly_rate * (1 + monthly_rate) ** n_payments)
-    else:
-        dscr_loan = 0
-
-    # Take lesser of LTV, DSCR, and optionally LTC (loan-to-cost)
-    perm_loan_max = min(ltv_loan, dscr_loan)
-    if perm_ltc_max is not None:
-        ltc_loan = sources_uses.tdc * perm_ltc_max
-        perm_loan_max = min(perm_loan_max, ltc_loan)
+    # Use canonical size_permanent_loan from debt.py (SINGLE SOURCE OF TRUTH)
+    perm_loan_result = size_permanent_loan(
+        stabilized_value=property_value_for_ltv,
+        stabilized_noi=stabilized_annual_noi,
+        ltv_max=perm_ltv_max,
+        dscr_min=perm_dscr_min,
+        perm_rate=perm_rate,
+        amort_years=perm_amort_years,
+        rate_buydown_bps=0,  # Buydown handled separately if needed
+        tdc=sources_uses.tdc,
+        ltc_max=perm_ltc_max,
+        max_loan_cap=sources_uses.construction_loan if cap_perm_at_construction else None,
+    )
+    perm_loan_max = perm_loan_result.loan_amount
 
     # Generate period-by-period cash flows
     periods: List[DetailedPeriodCashFlow] = []
@@ -555,6 +625,9 @@ def generate_detailed_cash_flow(
     reversion_value = 0.0
     fixed_perm_pmt = 0.0  # Set at perm loan origination, reused for all periods
 
+    # Track NOI history for trailing NOI calculation at reversion
+    noi_history: List[float] = []
+
     for period in range(1, total_periods + 1):
         # Determine dates
         period_start = start_date + relativedelta(months=period - 1)
@@ -569,10 +642,12 @@ def generate_detailed_cash_flow(
         is_ftm = is_operations and (period - leaseup_end) <= 12
 
         # Determine loan type
-        if period <= construction_end:
+        # Construction loan remains active through lease-up
+        # Perm loan takes out construction at stabilization (leaseup_end + 1)
+        if period <= leaseup_end:
             loan_type = LoanType.CONSTRUCTION if period > predev_end else LoanType.NONE
-        elif period == construction_end + 1:
-            # Conversion period - both loans active briefly
+        elif period == leaseup_end + 1:
+            # Conversion period - perm takes out construction
             loan_type = LoanType.PERMANENT
         else:
             loan_type = LoanType.PERMANENT
@@ -592,8 +667,10 @@ def generate_detailed_cash_flow(
             loan_type=loan_type,
         )
 
-        # Development section (from draw schedule during predev/construction)
-        if period <= construction_end:
+        # Development section (from draw schedule during predev/construction/leaseup)
+        # Draw schedule now extends through lease-up because construction loan
+        # remains outstanding with interest accruing until perm takeout
+        if period <= leaseup_end:
             draw = draw_schedule.get_period(period)
             development = DevelopmentRow(
                 tdc_total=sources_uses.tdc,
@@ -620,7 +697,7 @@ def generate_detailed_cash_flow(
             const_loan_balance = draw.const_debt_eop
             total_equity_invested += abs(draw.equity_draw)
         else:
-            # No development draws after construction
+            # No development draws after lease-up (perm loan has taken out construction)
             development = DevelopmentRow(
                 tdc_total=sources_uses.tdc,
                 tdc_bop=0,
@@ -665,25 +742,27 @@ def generate_detailed_cash_flow(
             prop_tax_bump=tax_bump,
         )
 
-        # GPR
-        # Apply escalation
-        base_gpr_market = monthly_gpr_at_stabilization
-        escalated_gpr_market = base_gpr_market * (1 + market_bump)
+        # GPR - using actual values from unit allocations, with escalation
+        # all_market_gpr_monthly = what GPR would be if all units were market rate
+        # market_gpr_monthly = actual GPR from market-rate units
+        # affordable_gpr_monthly = actual GPR from affordable units (at AMI rents)
 
-        # Mixed income GPR
-        market_portion = 1 - affordable_pct
-        affordable_portion = affordable_pct
-        affordable_rent = base_gpr_market * (1 - affordable_rent_discount)
-        escalated_affordable = affordable_rent * (1 + affordable_bump)
+        # Use all_market for the comparison row (if not provided, derive from total)
+        base_all_market = all_market_gpr_monthly if all_market_gpr_monthly > 0 else (market_gpr_monthly + affordable_gpr_monthly)
+        escalated_all_market = base_all_market * (1 + market_bump)
 
-        # Calculate blended GPR for mixed-income scenario
-        gpr_mixed_total = (escalated_gpr_market * market_portion) + (escalated_affordable * affordable_portion)
+        # Actual GPR from each unit type
+        escalated_market = market_gpr_monthly * (1 + market_bump)
+        escalated_affordable = affordable_gpr_monthly * (1 + affordable_bump)
+
+        # Total blended GPR for this scenario
+        gpr_mixed_total = escalated_market + escalated_affordable
 
         gpr = GPRRow(
-            gpr_all_market=escalated_gpr_market,
-            gpr_mixed_market=escalated_gpr_market * market_portion,
-            gpr_mixed_affordable=escalated_affordable * affordable_portion,
-            gpr_total=gpr_mixed_total,  # Blended GPR based on unit mix
+            gpr_all_market=escalated_all_market,  # Hypothetical: all units at market rent
+            gpr_mixed_market=escalated_market,     # Actual: market units only
+            gpr_mixed_affordable=escalated_affordable,  # Actual: affordable units only
+            gpr_total=gpr_mixed_total,  # Total blended GPR
         )
 
         # Operating expenses
@@ -766,6 +845,7 @@ def generate_detailed_cash_flow(
                 vacancy_rate=0,
                 less_vacancy=0,
                 egi=0,
+                less_management_fee=0,
                 less_opex_ex_taxes=0,
                 less_property_taxes=0,
                 noi=0,
@@ -799,8 +879,11 @@ def generate_detailed_cash_flow(
             # TIF reimbursement adds to NOI
             tif_reimb = tif_row.tif_reimbursement if tif_row else 0.0
 
-            # NOI = EGI - OpEx + TIF Reimbursement
-            base_noi = period_egi - opex.total_opex
+            # Management fee as % of EGI
+            period_mgmt_fee = period_egi * management_fee_pct
+
+            # NOI = EGI - Management Fee - OpEx + TIF Reimbursement
+            base_noi = period_egi - period_mgmt_fee - opex.total_opex
             adjusted_noi = base_noi + tif_reimb
 
             operations = OperationsRow(
@@ -809,6 +892,7 @@ def generate_detailed_cash_flow(
                 vacancy_rate=total_vacancy_pct,  # Includes unleased units + economic vacancy
                 less_vacancy=period_vacancy,
                 egi=period_egi,
+                less_management_fee=period_mgmt_fee,
                 less_opex_ex_taxes=opex.opex_ex_prop_taxes,
                 less_property_taxes=opex.property_taxes,
                 noi=adjusted_noi,
@@ -818,6 +902,7 @@ def generate_detailed_cash_flow(
             )
             noi = operations.noi
             total_noi += noi
+            noi_history.append(noi)
 
         # Investment (unlevered cash flow)
         dev_cost = -development.tdc_to_be_funded if period <= construction_end else 0
@@ -825,11 +910,24 @@ def generate_detailed_cash_flow(
 
         # Reversion
         if is_reversion:
-            # Calculate sale price
-            terminal_noi = noi * 12  # Annualize
-            sale_price = terminal_noi / exit_cap_rate
-            reversion_amount = sale_price
-            reversion_value = sale_price
+            # Calculate terminal NOI based on reversion_noi_basis
+            if reversion_noi_basis == "trailing" and len(noi_history) >= 12:
+                # Use last 12 months of actual NOI (trailing twelve months)
+                trailing_12_months = noi_history[-12:]
+                terminal_noi = sum(trailing_12_months)
+            else:
+                # Forward NOI: use current period's NOI annualized (default)
+                terminal_noi = noi * 12
+
+            # Calculate sale price using exit cap rate
+            sale_price_gross = terminal_noi / exit_cap_rate
+
+            # Deduct selling costs (broker fees, legal, closing costs, etc.)
+            selling_costs = sale_price_gross * selling_costs_pct
+            sale_price_net = sale_price_gross - selling_costs
+
+            reversion_amount = sale_price_net
+            reversion_value = sale_price_net
         else:
             reversion_amount = 0
 
@@ -841,7 +939,9 @@ def generate_detailed_cash_flow(
         )
 
         # Construction debt
-        if period <= construction_end:
+        # Construction loan remains outstanding through lease-up
+        # Perm loan takes it out at stabilization (first month of operations)
+        if period <= leaseup_end:
             draw = draw_schedule.get_period(period)
             const_debt = ConstructionDebtRow(
                 principal_bop=draw.const_debt_bop,
@@ -849,10 +949,10 @@ def generate_detailed_cash_flow(
                 interest_in_period=draw.const_debt_interest,
                 repaid=0,
                 principal_eop=draw.const_debt_eop,
-                net_cf=draw.const_debt_draw,  # Inflow from draws
+                net_cf=draw.const_debt_draw,  # Inflow from draws (0 during lease-up)
             )
-        elif period == construction_end + 1:
-            # Payoff construction loan
+        elif period == leaseup_end + 1:
+            # Payoff construction loan - perm loan takes out at stabilization
             # Save balance before zeroing - this caps the perm loan (no cash-out refi)
             const_loan_payoff_amount = const_loan_balance
             const_debt = ConstructionDebtRow(
@@ -875,8 +975,9 @@ def generate_detailed_cash_flow(
             )
 
         # Permanent debt
+        # Perm loan originates at stabilization (after lease-up), takes out construction loan
         perm_monthly_rate = perm_rate / 12 if perm_rate > 0 else 0.0
-        if period == construction_end + 1:
+        if period == leaseup_end + 1:
             # Perm loan funds — calculate fixed payment at origination
             if cap_perm_at_construction:
                 # Cap at construction loan payoff (no cash-out refi)
@@ -899,7 +1000,7 @@ def generate_detailed_cash_flow(
             )
             perm_loan_balance = perm_loan_amount - p_pmt
             total_debt_service += fixed_perm_pmt
-        elif period > construction_end + 1 and not is_reversion:
+        elif period > leaseup_end + 1 and not is_reversion:
             # Regular perm loan payments — use fixed payment from origination
             i_pmt = calculate_interest_portion(perm_loan_balance, perm_monthly_rate)
             p_pmt = calculate_principal_portion(fixed_perm_pmt, i_pmt)
@@ -947,8 +1048,12 @@ def generate_detailed_cash_flow(
                 mezz_principal_pmt = 0.0
                 mezz_pmt = mezz_interest
             else:
-                # Amortizing mezz (rare but possible)
-                mezz_pmt = mezz_interest * 1.2  # Rough approximation
+                # Amortizing mezz - use proper amortization calculation
+                n_months = mezzanine_amort_years * 12
+                if mezz_monthly_rate > 0 and n_months > 0:
+                    mezz_pmt = -npf.pmt(mezz_monthly_rate, n_months, mezzanine_amount)
+                else:
+                    mezz_pmt = mezz_interest
                 mezz_principal_pmt = mezz_pmt - mezz_interest
 
             if is_reversion:
@@ -1102,4 +1207,206 @@ def generate_detailed_cash_flow(
         total_noi=total_noi,
         total_debt_service=total_debt_service,
         reversion_value=reversion_value,
+    )
+
+
+def calculate_deal(
+    inputs: ProjectInputs,
+    scenario: Scenario,
+    tif_lump_sum: float = 0.0,
+    tif_treatment: str = "none",
+    tif_abatement_pct: float = 0.0,
+    tif_abatement_years: int = 0,
+    tif_stream_pct: float = 0.0,
+    tif_stream_years: int = 0,
+    tif_start_delay_months: Optional[int] = None,  # None = derive from inputs.tif_start_timing
+    mezzanine_amount: float = 0.0,
+    mezzanine_rate: float = 0.12,
+    preferred_amount: float = 0.0,
+    preferred_return: float = 0.10,
+) -> DetailedCashFlowResult:
+    """Calculate a complete deal with proper GPR from unit allocations.
+
+    This is the SINGLE SOURCE OF TRUTH for all financial calculations.
+    All summary metrics are derived from the period-by-period calculations.
+
+    Args:
+        inputs: Project inputs including unit mix, rents, costs, timing
+        scenario: MARKET or MIXED_INCOME
+        tif_lump_sum: TIF lump sum amount (if applicable)
+        tif_treatment: "none", "lump_sum", "abatement", or "stream"
+        tif_abatement_pct: Percentage of city taxes abated (0-1)
+        tif_abatement_years: Years of abatement
+        tif_stream_pct: Percentage of city increment reimbursed (0-1)
+        tif_stream_years: Years of TIF stream
+        tif_start_delay_months: Delay from stabilization to TIF start
+        mezzanine_amount: Mezzanine debt amount
+        mezzanine_rate: Mezzanine interest rate
+        preferred_amount: Preferred equity amount
+        preferred_return: Preferred return rate
+
+    Returns:
+        DetailedCashFlowResult with all periods and derived summary metrics.
+        The IRR, TDC, equity, and all other metrics are calculated FROM
+        the period-by-period cash flows.
+    """
+    # Determine affordable percentage based on scenario
+    if scenario == Scenario.MARKET:
+        affordable_pct = 0.0
+    else:
+        affordable_pct = inputs.affordable_pct
+
+    # Determine TIF start delay from inputs.tif_start_timing if not explicitly set
+    if tif_start_delay_months is None:
+        if inputs.tif_start_timing == TIFStartTiming.LEASEUP:
+            # TIF starts at construction end (beginning of leaseup)
+            # Relative to stabilization, this is -leaseup_months
+            tif_start_delay_months = -inputs.leaseup_months
+        else:
+            # OPERATIONS (default): TIF starts at stabilization
+            tif_start_delay_months = 0
+
+    # Calculate unit allocations with proper rent calculations
+    allocations = allocate_units(
+        target_units=inputs.target_units,
+        unit_mix=inputs.unit_mix,
+        affordable_pct=affordable_pct,
+        ami_level=inputs.ami_level,
+        market_rent_psf=inputs.market_rent_psf,
+    )
+
+    # Calculate GPR from allocations (proper AMI rent lookups)
+    gpr_result = calculate_gpr(allocations)
+
+    # Also calculate all-market GPR (for comparison display)
+    # This is what GPR would be if all units were at market rents
+    all_market_allocations = allocate_units(
+        target_units=inputs.target_units,
+        unit_mix=inputs.unit_mix,
+        affordable_pct=0.0,  # All market
+        ami_level=inputs.ami_level,
+        market_rent_psf=inputs.market_rent_psf,
+    )
+    all_market_gpr = calculate_gpr(all_market_allocations)
+
+    # Calculate hard costs WITH contingency
+    hard_costs_base = inputs.target_units * inputs.hard_cost_per_unit
+    hard_cost_contingency = hard_costs_base * inputs.hard_cost_contingency_pct
+    hard_costs = hard_costs_base + hard_cost_contingency
+
+    # Calculate effective soft cost percentage including:
+    # - Base soft cost % (with contingency)
+    # - Predevelopment costs (as % of hard costs)
+    # - Developer fee (as % of hard costs)
+    soft_cost_with_contingency = inputs.soft_cost_pct * (1 + inputs.soft_cost_contingency_pct)
+    effective_soft_cost_pct = (
+        soft_cost_with_contingency +
+        inputs.predevelopment_cost_pct +
+        inputs.developer_fee_pct
+    )
+
+    # Calculate breakdown dollar amounts for display
+    soft_cost_base = hard_costs * inputs.soft_cost_pct
+    soft_cost_contingency = soft_cost_base * inputs.soft_cost_contingency_pct
+    predevelopment_costs = hard_costs * inputs.predevelopment_cost_pct
+    developer_fee = hard_costs * inputs.developer_fee_pct
+
+    # Calculate annual opex
+    annual_opex_per_unit = (
+        inputs.opex_utilities +
+        inputs.opex_maintenance +
+        inputs.opex_misc
+    )
+
+    # Get tax stack from inputs (uses input tax rates or defaults to Austin stack)
+    if inputs.tax_rates:
+        tax_stack = build_tax_stack_from_rates(inputs.tax_rates)
+    else:
+        tax_stack = get_austin_tax_stack()
+
+    # Call the detailed cash flow generator with proper GPR values
+    return generate_detailed_cash_flow(
+        # Sources & Uses inputs
+        land_cost=inputs.land_cost,
+        hard_costs=hard_costs,
+        soft_cost_pct=effective_soft_cost_pct,
+        construction_ltc=inputs.construction_ltc,
+        construction_rate=inputs.construction_rate,
+
+        # Timing
+        start_date=inputs.predevelopment_start,
+        predevelopment_months=inputs.predevelopment_months,
+        construction_months=inputs.construction_months,
+        idc_leaseup_months=inputs.idc_leaseup_months,
+        leaseup_months=inputs.leaseup_months,
+        operations_months=inputs.operations_months,
+
+        # Revenue - PROPER GPR from unit allocations
+        market_gpr_monthly=gpr_result.market_gpr_monthly,
+        affordable_gpr_monthly=gpr_result.affordable_gpr_monthly,
+        all_market_gpr_monthly=all_market_gpr.total_gpr_monthly,
+        vacancy_rate=inputs.vacancy_rate,
+        leaseup_pace=inputs.leaseup_pace,
+        max_occupancy=inputs.max_occupancy,
+
+        # Operating expenses
+        annual_opex_per_unit=annual_opex_per_unit,
+        total_units=inputs.target_units,
+
+        # Property tax assessed value (required)
+        existing_assessed_value=inputs.existing_assessed_value,
+
+        # === Optional parameters with defaults ===
+        # Management fee
+        management_fee_pct=inputs.opex_management_pct,
+
+        # Reserves
+        operating_reserve_months=inputs.operating_reserve_months,
+        leaseup_reserve_months=inputs.leaseup_reserve_months,
+
+        # Property tax options
+        tax_stack=tax_stack,
+        assessment_growth_rate=inputs.property_tax_growth,
+
+        # Escalation
+        market_rent_growth=inputs.market_rent_growth,
+        opex_growth=inputs.opex_growth,
+        prop_tax_growth=inputs.property_tax_growth,
+
+        # Permanent loan
+        perm_rate=inputs.perm_rate,
+        perm_amort_years=inputs.perm_amort_years,
+        perm_ltv_max=inputs.perm_ltv_max,
+        perm_dscr_min=inputs.perm_dscr_min,
+
+        # Exit
+        exit_cap_rate=inputs.exit_cap_rate,
+        reserves_pct=inputs.reserves_pct,
+        selling_costs_pct=inputs.selling_costs_pct,
+        reversion_noi_basis=inputs.reversion_noi_basis,
+
+        # Mixed income
+        affordable_pct=affordable_pct,
+        affordable_rent_growth=inputs.affordable_rent_growth,
+
+        # TIF treatment
+        tif_treatment=tif_treatment,
+        tif_lump_sum=tif_lump_sum,
+        tif_abatement_pct=tif_abatement_pct,
+        tif_abatement_years=tif_abatement_years,
+        tif_stream_pct=tif_stream_pct,
+        tif_stream_years=tif_stream_years,
+        tif_start_delay_months=tif_start_delay_months,
+
+        # Additional capital
+        mezzanine_amount=mezzanine_amount,
+        mezzanine_rate=mezzanine_rate,
+        preferred_amount=preferred_amount,
+        preferred_return=preferred_return,
+
+        # Detailed breakdown for display
+        hard_cost_contingency=hard_cost_contingency,
+        soft_cost_contingency=soft_cost_contingency,
+        predevelopment_costs=predevelopment_costs,
+        developer_fee=developer_fee,
     )

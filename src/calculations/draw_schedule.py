@@ -81,6 +81,7 @@ class DrawSchedule:
     # Phase boundaries
     predevelopment_end: int = 0  # Last period of predevelopment
     construction_end: int = 0  # Last period of construction
+    leaseup_end: int = 0  # Last period of lease-up (when perm loan takes out construction)
 
     def get_period(self, period: int) -> PeriodDraw:
         """Get draw info for a specific period (1-indexed)."""
@@ -156,7 +157,10 @@ def generate_draw_schedule(
     predevelopment_months: int,
     construction_months: int,
     construction_rate: float,
+    leaseup_months: int = 0,
     tif_lump_sum: float = 0.0,
+    predev_costs: float | None = None,
+    construction_costs: float | None = None,
     predev_curve: Literal["flat", "s_curve"] = "s_curve",
     construction_curve: Literal["flat", "s_curve"] = "s_curve",
 ) -> DrawSchedule:
@@ -168,6 +172,7 @@ def generate_draw_schedule(
     3. Construction loan draws THIRD until exhausted
     4. IDC capitalizes each period based on loan balance
     5. S-curves applied to predevelopment and construction draws
+    6. During lease-up, no new draws but interest accrues on construction loan
 
     The capital stack must equal 100% of TDC:
     - Debt = ~65% of TDC (bank's LTC cap)
@@ -180,7 +185,10 @@ def generate_draw_schedule(
         predevelopment_months: Number of months of predevelopment
         construction_months: Number of months of construction
         construction_rate: Annual interest rate on construction loan
+        leaseup_months: Months of lease-up (construction loan stays outstanding)
         tif_lump_sum: TIF lump sum amount (drawn after equity, before debt)
+        predev_costs: Actual predevelopment costs (land + soft). If None, estimates from TDC.
+        construction_costs: Actual construction costs (hard + IDC). If None, estimates from TDC.
         predev_curve: Draw curve type for predevelopment
         construction_curve: Draw curve type for construction
 
@@ -188,18 +196,23 @@ def generate_draw_schedule(
         DrawSchedule with period-by-period draws
     """
     monthly_rate = construction_rate / 12
-    total_periods = predevelopment_months + construction_months
+    total_periods = predevelopment_months + construction_months + leaseup_months
 
     # Determine how much TDC is drawn in each phase
-    # Predevelopment typically covers land, soft costs, some hard costs
-    # For simplicity, assume predevelopment = (land + soft costs) / TDC
-    # But we don't have that breakdown here, so use a heuristic:
-    # Predevelopment = ~15% of TDC (typical for soft costs + land deposits)
-    predev_pct = 0.15
-    construction_pct = 0.85
-
-    predev_tdc = tdc * predev_pct
-    construction_tdc = tdc * construction_pct
+    # Use actual breakdown if provided, otherwise estimate
+    if predev_costs is not None and construction_costs is not None:
+        predev_tdc = predev_costs
+        construction_tdc = construction_costs
+        # Calculate percentages for tdc_draw_pct field
+        predev_pct = predev_tdc / tdc if tdc > 0 else 0.0
+        construction_pct = construction_tdc / tdc if tdc > 0 else 0.0
+    else:
+        # Fallback: estimate based on typical breakdown
+        # This should rarely be used - callers should provide actual values
+        predev_pct = 0.15
+        construction_pct = 0.85
+        predev_tdc = tdc * predev_pct
+        construction_tdc = tdc * construction_pct
 
     # Generate draw weights
     if predev_curve == "s_curve":
@@ -367,6 +380,58 @@ def generate_draw_schedule(
             is_debt_phase=const_debt_draw > 0,
         ))
 
+    # Lease-up periods
+    # Construction loan remains outstanding until perm loan takes it out
+    # Interest continues to accrue on the full balance, no new principal draws
+    for i in range(leaseup_months):
+        period_num += 1
+
+        # No TDC draws during lease-up
+        tdc_bop = tdc_remaining
+        tdc_eop = tdc_remaining
+
+        # No equity/TIF draws
+        equity_bop = equity_remaining
+        equity_eop = equity_remaining
+        tif_bop = tif_remaining
+        tif_eop = tif_remaining
+
+        # Construction debt: no new draws, interest accrues on full balance
+        const_debt_bop = const_debt_balance
+        const_debt_draw = 0.0
+        const_debt_interest = const_debt_balance * monthly_rate
+        total_idc += const_debt_interest
+        const_debt_balance = const_debt_bop + const_debt_interest
+        const_debt_eop = const_debt_balance
+
+        periods.append(PeriodDraw(
+            period=period_num,
+            phase=Phase.LEASE_UP,
+            tdc_total=tdc,
+            tdc_bop=tdc_bop,
+            tdc_draw_pct=0.0,
+            tdc_draw_predev=0.0,
+            tdc_draw_construction=0.0,
+            tdc_draw_total=0.0,
+            tdc_eop=tdc_eop,
+            equity_total=equity,
+            equity_bop=equity_bop,
+            equity_draw=0.0,
+            equity_eop=equity_eop,
+            tif_total=tif_lump_sum,
+            tif_bop=tif_bop,
+            tif_draw=0.0,
+            tif_eop=tif_eop,
+            const_debt_total=construction_loan,
+            const_debt_bop=const_debt_bop,
+            const_debt_draw=const_debt_draw,
+            const_debt_interest=const_debt_interest,
+            const_debt_eop=const_debt_eop,
+            is_equity_phase=False,
+            is_tif_phase=False,
+            is_debt_phase=True,  # Interest is still accruing
+        ))
+
     return DrawSchedule(
         periods=periods,
         total_periods=total_periods,
@@ -377,6 +442,7 @@ def generate_draw_schedule(
         total_idc_actual=total_idc,
         predevelopment_end=predevelopment_months,
         construction_end=predevelopment_months + construction_months,
+        leaseup_end=predevelopment_months + construction_months + leaseup_months,
     )
 
 
@@ -385,6 +451,7 @@ def generate_draw_schedule_from_sources_uses(
     predevelopment_months: int,
     construction_months: int,
     construction_rate: float,
+    leaseup_months: int = 0,
     land_draw_period: int = 1,
     predev_curve: Literal["flat", "s_curve"] = "s_curve",
     construction_curve: Literal["flat", "s_curve"] = "s_curve",
@@ -394,23 +461,28 @@ def generate_draw_schedule_from_sources_uses(
     This version uses the actual cost breakdown from SourcesUses
     to determine predevelopment vs construction draws.
 
+    The draw schedule continues through lease-up because the construction
+    loan remains outstanding (accruing interest) until the permanent loan
+    takes it out at stabilization.
+
     Args:
         sources_uses: SourcesUses object with capital stack
         predevelopment_months: Number of months of predevelopment
         construction_months: Number of months of construction
         construction_rate: Annual interest rate on construction loan
+        leaseup_months: Number of months of lease-up (interest continues to accrue)
         land_draw_period: Period in which land is acquired (1 = first period)
         predev_curve: Draw curve type for predevelopment (excluding land)
         construction_curve: Draw curve type for construction
 
     Returns:
-        DrawSchedule with period-by-period draws
+        DrawSchedule with period-by-period draws through stabilization
     """
     # Import here to avoid circular dependency
     from src.calculations.sources_uses import SourcesUses
 
     monthly_rate = construction_rate / 12
-    total_periods = predevelopment_months + construction_months
+    total_periods = predevelopment_months + construction_months + leaseup_months
 
     # Predevelopment costs: land + soft costs
     # Land is typically drawn in period 1 (closing)
@@ -568,6 +640,55 @@ def generate_draw_schedule_from_sources_uses(
             is_debt_phase=const_debt_draw > 0 or const_debt_interest > 0,
         ))
 
+    # Lease-up periods
+    # Construction loan remains outstanding until perm loan takes it out at stabilization
+    # Interest continues to accrue on the full balance, no new principal draws
+    for i in range(leaseup_months):
+        period_num += 1
+
+        # No TDC draws during lease-up (construction is complete)
+        tdc_bop = tdc_remaining
+        tdc_eop = tdc_remaining
+
+        # No equity draws
+        equity_bop = equity_remaining
+        equity_eop = equity_remaining
+
+        # Construction debt: no new draws, but interest accrues on full balance
+        const_debt_bop = const_debt_balance
+        const_debt_draw = 0.0
+
+        # Interest accrues on the full balance (loan is fully drawn)
+        const_debt_interest = const_debt_balance * monthly_rate
+        total_idc_actual += const_debt_interest
+
+        # Interest capitalizes (adds to balance) until perm takeout
+        const_debt_balance = const_debt_bop + const_debt_interest
+        const_debt_eop = const_debt_balance
+
+        periods.append(PeriodDraw(
+            period=period_num,
+            phase=Phase.LEASE_UP,
+            tdc_total=tdc,
+            tdc_bop=tdc_bop,
+            tdc_draw_pct=0.0,
+            tdc_draw_predev=0.0,
+            tdc_draw_construction=0.0,
+            tdc_draw_total=0.0,
+            tdc_eop=tdc_eop,
+            equity_total=equity,
+            equity_bop=equity_bop,
+            equity_draw=0.0,
+            equity_eop=equity_eop,
+            const_debt_total=construction_loan,
+            const_debt_bop=const_debt_bop,
+            const_debt_draw=const_debt_draw,
+            const_debt_interest=const_debt_interest,
+            const_debt_eop=const_debt_eop,
+            is_equity_phase=False,
+            is_debt_phase=True,  # Interest is still accruing
+        ))
+
     return DrawSchedule(
         periods=periods,
         total_periods=total_periods,
@@ -577,4 +698,5 @@ def generate_draw_schedule_from_sources_uses(
         total_idc_actual=total_idc_actual,
         predevelopment_end=predevelopment_months,
         construction_end=predevelopment_months + construction_months,
+        leaseup_end=predevelopment_months + construction_months + leaseup_months,
     )

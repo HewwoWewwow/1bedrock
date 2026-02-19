@@ -10,9 +10,14 @@ class SourcesUses:
 
     Uses:
         land: Land acquisition cost
-        hard_costs: Construction hard costs
-        soft_costs: Soft costs (design, legal, etc.)
+        hard_costs: Construction hard costs (base)
+        hard_cost_contingency: Contingency on hard costs
+        soft_costs: Soft costs (design, legal, etc.) including developer fee
+        soft_cost_contingency: Contingency on soft costs
+        predevelopment_costs: Predevelopment costs
         idc: Interest during construction (capitalized)
+        loan_fee: Construction loan origination fee
+        reserves: Operating and leaseup reserves
         tdc: Total development cost (sum of all uses)
 
     Sources:
@@ -24,10 +29,10 @@ class SourcesUses:
         ltc: Loan-to-cost ratio (construction_loan / tdc)
         equity_pct: Equity percentage (equity / tdc)
     """
-    # Uses
+    # Uses - totals
     land: float
-    hard_costs: float
-    soft_costs: float
+    hard_costs: float  # Base hard costs (before contingency)
+    soft_costs: float  # Base soft costs including developer fee (before contingency)
     idc: float
     tdc: float
 
@@ -42,6 +47,14 @@ class SourcesUses:
 
     # Breakdown for tracking
     soft_cost_pct: float  # Soft costs as % of hard costs
+
+    # Detailed breakdown (optional - for display)
+    hard_cost_contingency: float = 0.0
+    soft_cost_contingency: float = 0.0
+    predevelopment_costs: float = 0.0
+    developer_fee: float = 0.0
+    loan_fee: float = 0.0
+    reserves: float = 0.0
 
     def __post_init__(self):
         """Validate sources equal uses."""
@@ -60,6 +73,7 @@ def calculate_sources_uses(
     construction_rate: float,
     construction_months: int,
     predevelopment_months: int,
+    leaseup_months: int = 0,  # Months of lease-up (interest continues to accrue)
     tolerance: float = 100.0,
     max_iterations: int = 50,
 ) -> SourcesUses:
@@ -68,10 +82,11 @@ def calculate_sources_uses(
     The circular reference is:
     - TDC = Land + Hard + Soft + IDC
     - Construction Loan = TDC × LTC
-    - IDC = f(Loan Balance, Rate, Time)
+    - IDC = f(Loan Balance, Rate, Time) - calculated period-by-period
     - But Loan Balance depends on TDC...
 
-    We solve by iterating until IDC converges.
+    We solve by iterating until IDC converges, using actual period-by-period
+    interest calculation from the draw schedule (not an approximation).
 
     Args:
         land_cost: Land acquisition cost
@@ -81,6 +96,7 @@ def calculate_sources_uses(
         construction_rate: Annual interest rate on construction loan
         construction_months: Number of months of construction
         predevelopment_months: Number of months of predevelopment
+        leaseup_months: Months of lease-up (construction loan stays outstanding)
         tolerance: Convergence tolerance for IDC (dollars)
         max_iterations: Maximum iterations before giving up
 
@@ -90,19 +106,20 @@ def calculate_sources_uses(
     Raises:
         ValueError: If IDC doesn't converge
     """
+    # Import here to avoid circular dependency
+    from src.calculations.draw_schedule import generate_draw_schedule
+
     # Fixed costs (don't depend on IDC)
     soft_costs = hard_costs * soft_cost_pct
-    costs_before_idc = land_cost + hard_costs + soft_costs
-
-    # Monthly rate
-    monthly_rate = construction_rate / 12
+    predev_costs = land_cost + soft_costs  # Land + soft costs in predevelopment
 
     # Initial estimate: IDC = 0
     idc = 0.0
 
     for iteration in range(max_iterations):
         # Calculate TDC with current IDC estimate
-        tdc = costs_before_idc + idc
+        # TDC = predev costs + hard costs + IDC
+        tdc = predev_costs + hard_costs + idc
 
         # Size the construction loan
         construction_loan = tdc * construction_ltc
@@ -110,23 +127,28 @@ def calculate_sources_uses(
         # Calculate equity (funds first, before debt)
         equity = tdc - construction_loan
 
-        # Calculate new IDC estimate
-        # IDC accrues on the construction loan balance during construction
-        # Using average balance method for S-curve approximation:
-        # - First half of construction: loan ramps up
-        # - Second half: loan at full draw
-        # Average balance ≈ 65% of full loan amount for S-curve
-        average_balance_factor = 0.65
-        average_balance = construction_loan * average_balance_factor
+        # Generate draw schedule to get actual period-by-period IDC
+        # This calculates interest based on actual loan balances as costs are drawn
+        # Pass actual cost breakdown instead of using heuristics
+        draw_schedule = generate_draw_schedule(
+            tdc=tdc,
+            equity=equity,
+            construction_loan=construction_loan,
+            predevelopment_months=predevelopment_months,
+            construction_months=construction_months,
+            construction_rate=construction_rate,
+            leaseup_months=leaseup_months,
+            predev_costs=predev_costs,  # Actual: land + soft
+            construction_costs=hard_costs + idc,  # Actual: hard + current IDC estimate
+        )
 
-        # Interest accrues for construction period
-        # (predevelopment is equity-funded, no debt interest)
-        new_idc = average_balance * monthly_rate * construction_months
+        # Get actual IDC from the draw schedule
+        new_idc = draw_schedule.total_idc_actual
 
         # Check convergence
         if abs(new_idc - idc) < tolerance:
             # Converged - build final result
-            final_tdc = costs_before_idc + new_idc
+            final_tdc = predev_costs + hard_costs + new_idc
             final_loan = final_tdc * construction_ltc
             final_equity = final_tdc - final_loan
 
@@ -150,59 +172,4 @@ def calculate_sources_uses(
     raise ValueError(
         f"IDC calculation did not converge after {max_iterations} iterations. "
         f"Last IDC: ${idc:,.0f}, tolerance: ${tolerance:,.0f}"
-    )
-
-
-def calculate_sources_uses_with_incentives(
-    land_cost: float,
-    hard_costs: float,
-    soft_cost_pct: float,
-    construction_ltc: float,
-    construction_rate: float,
-    construction_months: int,
-    predevelopment_months: int,
-    fee_waiver_amount: float = 0.0,
-    rate_buydown_bps: int = 0,
-    tolerance: float = 100.0,
-    max_iterations: int = 50,
-) -> SourcesUses:
-    """Calculate sources and uses with incentives applied.
-
-    Args:
-        land_cost: Land acquisition cost
-        hard_costs: Total hard construction costs
-        soft_cost_pct: Soft costs as percentage of hard costs
-        construction_ltc: Loan-to-cost ratio for construction loan
-        construction_rate: Annual interest rate on construction loan
-        construction_months: Number of months of construction
-        predevelopment_months: Number of months of predevelopment
-        fee_waiver_amount: SMART fee waiver reducing soft costs
-        rate_buydown_bps: Interest rate buydown in basis points
-        tolerance: Convergence tolerance for IDC (dollars)
-        max_iterations: Maximum iterations before giving up
-
-    Returns:
-        SourcesUses object with complete capital stack
-    """
-    # Reduce soft costs by fee waiver
-    soft_costs = hard_costs * soft_cost_pct - fee_waiver_amount
-    soft_costs = max(0, soft_costs)  # Can't go negative
-
-    # Adjust effective soft cost percentage
-    effective_soft_cost_pct = soft_costs / hard_costs if hard_costs > 0 else 0
-
-    # Reduce construction rate by buydown
-    effective_rate = construction_rate - (rate_buydown_bps / 10000)
-    effective_rate = max(0.01, effective_rate)  # Floor at 1%
-
-    return calculate_sources_uses(
-        land_cost=land_cost,
-        hard_costs=hard_costs,
-        soft_cost_pct=effective_soft_cost_pct,
-        construction_ltc=construction_ltc,
-        construction_rate=effective_rate,
-        construction_months=construction_months,
-        predevelopment_months=predevelopment_months,
-        tolerance=tolerance,
-        max_iterations=max_iterations,
     )

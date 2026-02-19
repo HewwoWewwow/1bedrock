@@ -1,9 +1,19 @@
-"""Metrics calculations and scenario comparison."""
+"""Metrics calculations and scenario comparison.
 
+NOTE: The `calculate_metrics()` function that takes DCFResult is DEPRECATED.
+Use `calculate_metrics_from_detailed()` instead, which works with the
+unified calculation engine's `DetailedCashFlowResult`.
+"""
+
+import warnings
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .dcf import DCFResult
 from ..models.project import Scenario
+
+if TYPE_CHECKING:
+    from .detailed_cashflow import DetailedCashFlowResult
 
 
 @dataclass
@@ -67,6 +77,11 @@ def calculate_metrics(
 ) -> ScenarioMetrics:
     """Calculate summary metrics from DCF result.
 
+    .. deprecated::
+        This function is DEPRECATED. Use `calculate_metrics_from_detailed()`
+        instead, which works with `DetailedCashFlowResult` from the unified
+        `calculate_deal()` engine.
+
     Args:
         dcf_result: Complete DCF analysis result.
         total_units: Total number of units.
@@ -76,6 +91,12 @@ def calculate_metrics(
     Returns:
         ScenarioMetrics with all summary values.
     """
+    warnings.warn(
+        "calculate_metrics() is deprecated. Use calculate_metrics_from_detailed() instead, "
+        "which works with DetailedCashFlowResult from calculate_deal().",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     affordable_pct = affordable_units / total_units if total_units > 0 else 0.0
 
     return ScenarioMetrics(
@@ -91,6 +112,67 @@ def calculate_metrics(
         unlevered_irr=dcf_result.unlevered_irr,
         levered_irr=dcf_result.levered_irr,
         equity_multiple=dcf_result.equity_multiple,
+        total_units=total_units,
+        affordable_units=affordable_units,
+        affordable_pct=affordable_pct,
+    )
+
+
+def calculate_metrics_from_detailed(
+    result: "DetailedCashFlowResult",
+    scenario: Scenario,
+    total_units: int,
+    affordable_units: int,
+    gpr_annual: float,
+) -> ScenarioMetrics:
+    """Calculate summary metrics from DetailedCashFlowResult.
+
+    This is the unified version that works with the single calculation engine.
+    All metrics are derived FROM the period-by-period calculations.
+
+    Args:
+        result: Complete detailed cash flow result from calculate_deal()
+        scenario: MARKET or MIXED_INCOME
+        total_units: Total number of units
+        affordable_units: Number of affordable units
+        gpr_annual: Annual Gross Potential Rent
+
+    Returns:
+        ScenarioMetrics with all summary values derived from the periods.
+    """
+    affordable_pct = affordable_units / total_units if total_units > 0 else 0.0
+
+    # Calculate equity multiple from periods
+    total_equity_out = abs(sum(p.levered_cf for p in result.periods if p.levered_cf < 0))
+    total_distributions = sum(p.levered_cf for p in result.periods if p.levered_cf > 0)
+    equity_multiple = total_distributions / total_equity_out if total_equity_out > 0 else 0.0
+
+    # Calculate stabilized NOI from operations periods
+    ops_periods = [p for p in result.periods
+                   if p.header.is_operations and not p.header.is_reversion]
+    if ops_periods:
+        # Use first stabilized operations period and annualize
+        stabilized_noi = ops_periods[0].operations.noi * 12
+    else:
+        stabilized_noi = result.total_noi
+
+    # Yield on cost
+    tdc = result.sources_uses.tdc
+    yield_on_cost = stabilized_noi / tdc if tdc > 0 else 0.0
+
+    return ScenarioMetrics(
+        scenario=scenario,
+        tdc=tdc,
+        tdc_per_unit=tdc / total_units if total_units > 0 else 0.0,
+        equity_required=result.sources_uses.equity,
+        debt_amount=result.sources_uses.construction_loan,
+        tif_value=0.0,  # TIF value calculated separately if needed
+        gpr_annual=gpr_annual,
+        noi_annual=stabilized_noi,
+        yield_on_cost=yield_on_cost,
+        unlevered_irr=result.unlevered_irr,
+        levered_irr=result.levered_irr,
+        equity_multiple=equity_multiple,
         total_units=total_units,
         affordable_units=affordable_units,
         affordable_pct=affordable_pct,

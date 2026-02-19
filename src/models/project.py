@@ -87,10 +87,14 @@ class ProjectInputs:
     operations_months: int = 12
 
     # === Land & Construction ===
-    land_cost_per_acre: float = 1_000_000.0
+    land_cost: float = 3_000_000.0  # Total land cost (lump sum)
     target_units: int = 200
-    hard_cost_per_unit: float = 175_000  # Excel default.0
-    soft_cost_pct: float = 0.44  # As % of hard costs (includes predevelopment + IDC buffer)
+    hard_cost_per_unit: float = 175_000  # Excel default
+    soft_cost_pct: float = 0.30  # As % of hard costs (design, legal, etc.)
+    predevelopment_cost_pct: float = 0.0972  # As % of hard costs (separate from soft costs)
+    hard_cost_contingency_pct: float = 0.05  # 5% contingency on hard costs
+    soft_cost_contingency_pct: float = 0.05  # 5% contingency on soft costs
+    developer_fee_pct: float = 0.04  # Developer fee as % of hard costs
     construction_type: ConstructionType = ConstructionType.PODIUM_5OVER1
 
     # === Unit Mix ===
@@ -130,6 +134,11 @@ class ProjectInputs:
     # Construction Loan
     construction_rate: float = 0.075
     construction_ltc: float = 0.65  # Loan-to-cost
+    idc_leaseup_months: int = 4  # Months of lease-up included in IDC (net of NOI offset)
+
+    # === Reserves ===
+    operating_reserve_months: int = 3  # Months of OpEx held in reserve
+    leaseup_reserve_months: int = 6  # Months of debt service held during lease-up
 
     # Permanent Loan
     perm_rate: float = 0.06
@@ -302,10 +311,14 @@ class ProjectInputs:
             construction_months=self.construction_months,
             leaseup_months=self.leaseup_months,
             operations_months=self.operations_months,
-            land_cost_per_acre=self.land_cost_per_acre,
+            land_cost=self.land_cost,
             target_units=self.target_units,
             hard_cost_per_unit=self.hard_cost_per_unit,
             soft_cost_pct=self.soft_cost_pct,
+            predevelopment_cost_pct=self.predevelopment_cost_pct,
+            hard_cost_contingency_pct=self.hard_cost_contingency_pct,
+            soft_cost_contingency_pct=self.soft_cost_contingency_pct,
+            developer_fee_pct=self.developer_fee_pct,
             construction_type=self.construction_type,
             unit_mix={k: UnitMixEntry(
                           v.unit_type, v.gsf, v.allocation,
@@ -327,6 +340,9 @@ class ProjectInputs:
             property_tax_growth=self.property_tax_growth,
             construction_rate=self.construction_rate,
             construction_ltc=self.construction_ltc,
+            idc_leaseup_months=self.idc_leaseup_months,
+            operating_reserve_months=self.operating_reserve_months,
+            leaseup_reserve_months=self.leaseup_reserve_months,
             perm_rate=self.perm_rate,
             perm_amort_years=self.perm_amort_years,
             perm_ltv_max=self.perm_ltv_max,

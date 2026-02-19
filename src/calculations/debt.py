@@ -66,14 +66,19 @@ def size_permanent_loan(
     perm_rate: float,
     amort_years: int,
     rate_buydown_bps: int = 0,
+    tdc: float | None = None,
+    ltc_max: float | None = None,
+    max_loan_cap: float | None = None,
 ) -> PermanentLoan:
-    """Size permanent loan as the lesser of LTV and DSCR constraints.
+    """Size permanent loan as the lesser of LTV, DSCR, and optional constraints.
 
-    The permanent loan is sized using two constraints:
+    The permanent loan is sized using multiple constraints:
     1. LTV Constraint: Loan <= Value x LTV_max
     2. DSCR Constraint: Loan <= Max loan where NOI / Debt_Service >= DSCR_min
+    3. LTC Constraint (optional): Loan <= TDC x LTC_max
+    4. Max Cap (optional): Loan <= max_loan_cap (e.g., construction loan)
 
-    The binding constraint is whichever produces the smaller loan.
+    The binding constraint is whichever produces the smallest loan.
 
     For DSCR constraint:
         Max annual debt service = NOI / DSCR_min
@@ -87,6 +92,9 @@ def size_permanent_loan(
         perm_rate: Annual interest rate (before buydown).
         amort_years: Amortization period in years.
         rate_buydown_bps: Interest rate reduction in basis points.
+        tdc: Total Development Cost (required if using ltc_max).
+        ltc_max: Maximum loan-to-cost ratio (optional constraint).
+        max_loan_cap: Maximum loan amount cap (e.g., construction loan).
 
     Returns:
         PermanentLoan with loan amount, constraints, and actual ratios.
@@ -128,13 +136,25 @@ def size_permanent_loan(
         fv=0,
     )
 
-    # Use the binding (smaller) constraint
+    # Start with LTV vs DSCR
     if ltv_constrained <= dscr_constrained:
         loan_amount = ltv_constrained
         binding_constraint = "LTV"
     else:
         loan_amount = dscr_constrained
         binding_constraint = "DSCR"
+
+    # Optional LTC constraint
+    if ltc_max is not None and tdc is not None:
+        ltc_constrained = tdc * ltc_max
+        if ltc_constrained < loan_amount:
+            loan_amount = ltc_constrained
+            binding_constraint = "LTC"
+
+    # Optional max cap (e.g., no cash-out refinance - cap at construction loan)
+    if max_loan_cap is not None and max_loan_cap < loan_amount:
+        loan_amount = max_loan_cap
+        binding_constraint = "CAP"
 
     # Calculate actual debt service
     monthly_payment = -npf.pmt(
