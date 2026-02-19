@@ -18,26 +18,21 @@ from src.models.incentives import IncentiveTier, IncentiveToggles, get_tier_conf
 from src.calculations.dcf import run_dcf
 from src.calculations.units import allocate_units, get_total_units, get_total_affordable_units
 from src.calculations.revenue import calculate_gpr
-from src.calculations.metrics import calculate_metrics, compare_scenarios
+from src.calculations.metrics import calculate_metrics, calculate_metrics_from_detailed, compare_scenarios
 from src.scenarios import run_scenario_matrix, generate_combinations
-from src.calculations.detailed_cashflow import generate_detailed_cash_flow
+from src.calculations.detailed_cashflow import generate_detailed_cash_flow, calculate_deal
 from src.calculations.sources_uses import calculate_sources_uses
 from src.calculations.property_tax import get_austin_tax_stack, analyze_tif
 from ui.components.detailed_cashflow_view import (
     render_sources_uses, render_detailed_cashflow_table,
     render_irr_summary, render_property_tax_engine, render_sensitivity_analysis,
-    render_deal_summary_header, export_cashflow_to_csv, render_exit_waterfall,
-    render_operating_statement
+    render_deal_summary_header, export_cashflow_to_csv, export_cashflow_to_excel,
+    render_exit_waterfall, render_operating_statement
 )
 from ui.components.unit_mix import (
     render_unit_mix_tab, get_unit_mix_from_session_state, get_efficiency
 )
-from ui.components.sources_uses_detailed_view import (
-    render_sources_uses_inputs, render_sources_uses_detailed_table
-)
-from src.calculations.sources_uses_detailed import (
-    LandCostMethod, calculate_sources_uses_detailed
-)
+from ui.components.spreadsheet_debug_view import render_full_debug_page
 from src.models.scenario_config import (
     ModelMode, ProjectType, TIFTreatment, TIFConfig,
     ScenarioInputs, ModelConfig, SharedInputs,
@@ -134,8 +129,13 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None, is_mixed_income: bo
         is_mixed_income = affordable_pct > 0
     else:
         target_units = st.session_state.get("target_units", 200)
-        affordable_pct = st.session_state.get("affordable_pct", 20.0) / 100
-        ami_level = st.session_state.get("ami_level", "50%")
+        # Market rate scenarios have 0% affordable, mixed income reads from session state
+        if is_mixed_income:
+            affordable_pct = st.session_state.get("affordable_pct", 20.0) / 100
+            ami_level = st.session_state.get("ami_level", "50%")
+        else:
+            affordable_pct = 0.0
+            ami_level = "50%"  # Not used for market rate
 
     # Determine prefix for reading inputs
     prefix = "mixed_" if is_mixed_income else ""
@@ -161,11 +161,13 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None, is_mixed_income: bo
         incentive_config = get_tier_config(tier, toggles)
     elif st.session_state.get("run_mixed", True) and is_mixed_income:
         tier = IncentiveTier(st.session_state.get("selected_tier", 2))
+        # NOTE: Defaults must match get_session_state_inputs() defaults
+        # Default: TIF lump sum ON, TIF stream OFF, SMART ON
         toggles = IncentiveToggles(
             smart_fee_waiver=st.session_state.get("smart_fee_waiver", True),
             tax_abatement=st.session_state.get("tax_abatement", False),
-            tif_lump_sum=st.session_state.get("tif_lump_sum", False),
-            tif_stream=st.session_state.get("tif_stream", True),
+            tif_lump_sum=st.session_state.get("tif_lump_sum", True),
+            tif_stream=st.session_state.get("tif_stream", False),
             interest_buydown=st.session_state.get("interest_buydown", False),
         )
         incentive_config = get_tier_config(tier, toggles)
@@ -176,10 +178,14 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None, is_mixed_income: bo
         construction_months=get_val("construction_months", 24),
         leaseup_months=get_val("leaseup_months", 12),
         operations_months=get_val("operations_months", 12),
-        land_cost_per_acre=get_val("land_cost_per_acre", 1_000_000),
+        land_cost=get_val("land_cost", 3_000_000),
         target_units=target_units,
-        hard_cost_per_unit=get_val("hard_cost_per_unit", 155_000),
+        hard_cost_per_unit=get_val("hard_cost_per_unit", 175_000),
         soft_cost_pct=get_val("soft_cost_pct", 30.0, as_pct=True),
+        predevelopment_cost_pct=get_val("predevelopment_cost_pct", 9.72, as_pct=True),
+        hard_cost_contingency_pct=get_val("hard_cost_contingency_pct", 5.0, as_pct=True),
+        soft_cost_contingency_pct=get_val("soft_cost_contingency_pct", 5.0, as_pct=True),
+        developer_fee_pct=get_val("developer_fee_pct", 4.0, as_pct=True),
         construction_type=ConstructionType(st.session_state.get("construction_type", "podium_midrise_5over1")),
         unit_mix=unit_mix,
         market_rent_psf=st.session_state.get("market_rent_psf", 2.50),
@@ -197,6 +203,8 @@ def get_inputs_for_scenario(scenario: ScenarioInputs = None, is_mixed_income: bo
         property_tax_growth=get_val("property_tax_growth_pct", 2.0, as_pct=True),
         construction_rate=get_val("construction_rate_pct", 7.5, as_pct=True),
         construction_ltc=get_val("construction_ltc_pct", 65.0, as_pct=True),
+        operating_reserve_months=get_val("operating_reserve_months", 3),
+        leaseup_reserve_months=get_val("leaseup_reserve_months", 6),
         perm_rate=get_val("perm_rate_pct", 6.0, as_pct=True),
         perm_amort_years=get_val("perm_amort_years", 20),
         perm_ltv_max=get_val("perm_ltv_max_pct", 65.0, as_pct=True),
@@ -267,10 +275,14 @@ def get_session_state_inputs() -> ProjectInputs:
         construction_months=st.session_state.get("construction_months", 24),
         leaseup_months=st.session_state.get("leaseup_months", 12),
         operations_months=st.session_state.get("operations_months", 12),
-        land_cost_per_acre=st.session_state.get("land_cost_per_acre", 1_000_000),
+        land_cost=st.session_state.get("land_cost", 3_000_000),
         target_units=st.session_state.get("target_units", 200),
-        hard_cost_per_unit=st.session_state.get("hard_cost_per_unit", 155_000),
+        hard_cost_per_unit=st.session_state.get("hard_cost_per_unit", 175_000),
         soft_cost_pct=st.session_state.get("soft_cost_pct", 30.0) / 100,
+        predevelopment_cost_pct=st.session_state.get("predevelopment_cost_pct", 9.72) / 100,
+        hard_cost_contingency_pct=st.session_state.get("hard_cost_contingency_pct", 5.0) / 100,
+        soft_cost_contingency_pct=st.session_state.get("soft_cost_contingency_pct", 5.0) / 100,
+        developer_fee_pct=st.session_state.get("developer_fee_pct", 4.0) / 100,
         construction_type=ConstructionType(st.session_state.get("construction_type", "podium_midrise_5over1")),
         unit_mix=unit_mix,
         market_rent_psf=st.session_state.get("market_rent_psf", 2.50),
@@ -288,6 +300,8 @@ def get_session_state_inputs() -> ProjectInputs:
         property_tax_growth=st.session_state.get("property_tax_growth_pct", 2.0) / 100,
         construction_rate=st.session_state.get("construction_rate_pct", 7.5) / 100,
         construction_ltc=st.session_state.get("construction_ltc_pct", 65.0) / 100,
+        operating_reserve_months=st.session_state.get("operating_reserve_months", 3),
+        leaseup_reserve_months=st.session_state.get("leaseup_reserve_months", 6),
         perm_rate=st.session_state.get("perm_rate_pct", 6.0) / 100,
         perm_amort_years=st.session_state.get("perm_amort_years", 20),
         perm_ltv_max=st.session_state.get("perm_ltv_max_pct", 65.0) / 100,
@@ -303,7 +317,10 @@ def get_session_state_inputs() -> ProjectInputs:
 
 
 def run_analysis(inputs: ProjectInputs, scenario_a: ScenarioInputs = None, scenario_b: ScenarioInputs = None):
-    """Run DCF analysis for both scenarios.
+    """Run unified deal analysis for both scenarios.
+
+    Uses calculate_deal() as the SINGLE SOURCE OF TRUTH for all calculations.
+    All metrics are derived from the period-by-period cash flows.
 
     Args:
         inputs: Base ProjectInputs (used if scenarios not provided)
@@ -312,40 +329,68 @@ def run_analysis(inputs: ProjectInputs, scenario_a: ScenarioInputs = None, scena
 
     Returns:
         Tuple of (market_result, mixed_result, market_metrics, mixed_metrics, comparison)
+        All results are DetailedCashFlowResult with full period data.
     """
-    # Build inputs for each scenario if provided
-    # Scenario A is market rate (no mixed income overrides)
+    # Build inputs for each scenario
+    # Scenario A is market rate (no mixed income overrides, reads from non-prefixed keys)
     if scenario_a:
         inputs_a = get_inputs_for_scenario(scenario_a, is_mixed_income=False)
     else:
-        inputs_a = inputs
+        # No scenario provided - build from session state using market rate keys
+        inputs_a = get_inputs_for_scenario(None, is_mixed_income=False)
 
-    # Scenario B is mixed income (use mixed income overrides)
+    # Scenario B is mixed income (use mixed income overrides, reads from mixed_ prefixed keys)
     if scenario_b:
         inputs_b = get_inputs_for_scenario(scenario_b, is_mixed_income=True)
     else:
-        inputs_b = inputs
+        # No scenario provided - build from session state using mixed income keys
+        inputs_b = get_inputs_for_scenario(None, is_mixed_income=True)
 
-    # Market scenario (scenario A or base inputs with 0% affordable)
-    market_result = run_dcf(inputs_a, Scenario.MARKET)
+    # Get TIF parameters from session state (for mixed income)
+    tif_lump_sum = st.session_state.get("calculated_tif_lump_sum", 0)
+    tif_enabled = st.session_state.get("tif_lump_sum", True)
+
+    # Market scenario - no incentives, 0% affordable
+    market_result = calculate_deal(
+        inputs=inputs_a,
+        scenario=Scenario.MARKET,
+        tif_lump_sum=0,
+        tif_treatment="none",
+    )
+
+    # Calculate market GPR for metrics (need unit counts)
     market_allocs = allocate_units(
         inputs_a.target_units, inputs_a.unit_mix, 0.0, inputs_a.ami_level, inputs_a.market_rent_psf
     )
     market_gpr = calculate_gpr(market_allocs)
-    market_metrics = calculate_metrics(
-        market_result, get_total_units(market_allocs), 0, market_gpr.total_gpr_annual
+    market_metrics = calculate_metrics_from_detailed(
+        market_result,
+        Scenario.MARKET,
+        get_total_units(market_allocs),
+        0,
+        market_gpr.total_gpr_annual
     )
 
-    # Mixed-income scenario (scenario B or base inputs with affordable %)
-    mixed_result = run_dcf(inputs_b, Scenario.MIXED_INCOME)
+    # Mixed-income scenario - with incentives
+    mixed_result = calculate_deal(
+        inputs=inputs_b,
+        scenario=Scenario.MIXED_INCOME,
+        tif_lump_sum=tif_lump_sum if tif_enabled else 0,
+        tif_treatment="lump_sum" if tif_enabled and tif_lump_sum > 0 else "none",
+    )
+
+    # Calculate mixed income GPR for metrics
     mixed_allocs = allocate_units(
         inputs_b.target_units, inputs_b.unit_mix, inputs_b.affordable_pct,
         inputs_b.ami_level, inputs_b.market_rent_psf
     )
     mixed_gpr = calculate_gpr(mixed_allocs)
-    mixed_metrics = calculate_metrics(
-        mixed_result, get_total_units(mixed_allocs),
-        get_total_affordable_units(mixed_allocs), mixed_gpr.total_gpr_annual
+    mixed_metrics = calculate_metrics_from_detailed(
+        mixed_result,
+        Scenario.MIXED_INCOME,
+        get_total_units(mixed_allocs),
+        get_total_affordable_units(mixed_allocs),
+        mixed_gpr.total_gpr_annual
     )
 
     comparison = compare_scenarios(market_metrics, mixed_metrics)
@@ -401,8 +446,35 @@ def render_sidebar():
 
     # Try to calculate metrics
     try:
+        # Initialize mixed income inputs BEFORE running analysis
+        # This ensures mixed_ prefixed keys exist so mixed income uses its own values
+        _initialize_mixed_income_inputs()
+
         inputs = get_session_state_inputs()
+
+        # DEBUG: Show key input values being used
+        with st.sidebar.expander("Debug: Input Values", expanded=False):
+            st.caption(f"const_rate: {inputs.construction_rate:.2%}")
+            st.caption(f"perm_rate: {inputs.perm_rate:.2%}")
+            st.caption(f"exit_cap: {inputs.exit_cap_rate:.2%}")
+            st.caption(f"target_units: {inputs.target_units}")
+            st.caption(f"hard_cost: ${inputs.hard_cost_per_unit:,}")
+
         market_result, mixed_result, market_metrics, mixed_metrics, comparison = run_analysis(inputs)
+
+        # DEBUG: Show calculated values
+        with st.sidebar.expander("Debug: Calculated", expanded=False):
+            st.caption(f"Market IRR: {market_metrics.levered_irr:.2%}")
+            st.caption(f"Mixed IRR: {mixed_metrics.levered_irr:.2%}")
+            st.caption(f"Market TDC: ${market_metrics.tdc:,.0f}")
+            st.caption(f"Diff bps: {comparison.irr_difference_bps}")
+
+        # Store results in session state for use by other tabs (single source of truth)
+        st.session_state["_cached_market_result"] = market_result
+        st.session_state["_cached_mixed_result"] = mixed_result
+        st.session_state["_cached_market_metrics"] = market_metrics
+        st.session_state["_cached_mixed_metrics"] = mixed_metrics
+        st.session_state["_cached_inputs"] = inputs
 
         # For single project mode, determine which scenario is active
         if not is_comparison:
@@ -534,8 +606,8 @@ def render_sidebar():
                 npv += cf.levered_cf / ((1 + monthly_rate) ** i)
             return npv
 
-        market_npv = calc_npv(market_result.monthly_cash_flows, npv_discount)
-        mixed_npv = calc_npv(mixed_result.monthly_cash_flows, npv_discount)
+        market_npv = calc_npv(market_result.periods, npv_discount)
+        mixed_npv = calc_npv(mixed_result.periods, npv_discount)
 
         col1, col2 = st.sidebar.columns(2)
         with col1:
@@ -577,6 +649,247 @@ def render_sidebar():
         st.sidebar.info("Configure project to see summary")
         import traceback
         st.sidebar.caption(f"Error: {e}")
+
+    # ========== DARK MODE TOGGLE (at bottom of sidebar) ==========
+    st.sidebar.divider()
+    dark_mode = st.sidebar.toggle(
+        "Dark Mode",
+        value=st.session_state.get("dark_mode", False),
+        key="dark_mode",
+        help="Toggle between light and dark color scheme"
+    )
+
+    # Apply dark mode CSS
+    if dark_mode:
+        st.markdown("""
+        <style>
+            /* Dark mode overrides */
+            .stApp {
+                background-color: #0e1117;
+                color: #fafafa;
+            }
+            .stSidebar {
+                background-color: #262730;
+            }
+            .stSidebar [data-testid="stSidebarContent"] {
+                background-color: #262730;
+            }
+            /* Metric cards */
+            [data-testid="stMetricValue"] {
+                color: #fafafa;
+            }
+            [data-testid="stMetricLabel"] {
+                color: #b0b0b0;
+            }
+            /* Headers */
+            h1, h2, h3, h4, h5, h6 {
+                color: #fafafa !important;
+            }
+            /* Text */
+            p, span, label, .stMarkdown {
+                color: #fafafa;
+            }
+            /* Dataframes */
+            .stDataFrame {
+                background-color: #1e1e1e;
+            }
+            .stDataFrame [data-testid="stDataFrameResizable"] {
+                background-color: #1e1e1e;
+            }
+            /* Tabs */
+            .stTabs [data-baseweb="tab-list"] {
+                background-color: #262730;
+            }
+            .stTabs [data-baseweb="tab"] {
+                color: #fafafa;
+            }
+            /* Inputs */
+            .stNumberInput input, .stTextInput input, .stSelectbox select {
+                background-color: #262730;
+                color: #fafafa;
+            }
+            /* Expander */
+            .streamlit-expanderHeader {
+                background-color: #262730;
+                color: #fafafa;
+            }
+            /* Success/Warning/Error boxes */
+            .stSuccess, .stWarning, .stError, .stInfo {
+                color: #fafafa;
+            }
+            /* Captions */
+            .stCaption {
+                color: #b0b0b0;
+            }
+        </style>
+        """, unsafe_allow_html=True)
+    else:
+        # Light mode (default) - explicit light colors
+        st.markdown("""
+        <style>
+            /* Light mode - explicit reset */
+            .stApp {
+                background-color: #ffffff;
+                color: #262730;
+            }
+            .stSidebar {
+                background-color: #f0f2f6;
+            }
+            .stSidebar [data-testid="stSidebarContent"] {
+                background-color: #f0f2f6;
+            }
+            /* Metric cards */
+            [data-testid="stMetricValue"] {
+                color: #262730;
+            }
+            [data-testid="stMetricLabel"] {
+                color: #555555;
+            }
+            /* Headers */
+            h1, h2, h3, h4, h5, h6 {
+                color: #262730 !important;
+            }
+            /* Text */
+            p, span, label, .stMarkdown {
+                color: #262730;
+            }
+            /* Dataframes */
+            .stDataFrame {
+                background-color: #ffffff;
+            }
+            .stDataFrame [data-testid="stDataFrameResizable"] {
+                background-color: #ffffff;
+            }
+            /* Tabs */
+            .stTabs [data-baseweb="tab-list"] {
+                background-color: #f0f2f6;
+            }
+            .stTabs [data-baseweb="tab"] {
+                color: #262730;
+            }
+            /* Number inputs */
+            .stNumberInput input {
+                background-color: #ffffff !important;
+                color: #262730 !important;
+            }
+            .stNumberInput [data-baseweb="input"] {
+                background-color: #ffffff !important;
+            }
+            .stNumberInput button {
+                background-color: #f0f2f6 !important;
+                color: #262730 !important;
+            }
+            /* Text inputs */
+            .stTextInput input {
+                background-color: #ffffff !important;
+                color: #262730 !important;
+            }
+            .stTextInput [data-baseweb="input"] {
+                background-color: #ffffff !important;
+            }
+            /* Selectbox / Dropdown */
+            .stSelectbox [data-baseweb="select"] {
+                background-color: #ffffff !important;
+            }
+            .stSelectbox [data-baseweb="select"] > div {
+                background-color: #ffffff !important;
+                color: #262730 !important;
+            }
+            .stSelectbox svg {
+                fill: #262730 !important;
+            }
+            /* Dropdown menu */
+            [data-baseweb="popover"] {
+                background-color: #ffffff !important;
+            }
+            [data-baseweb="menu"] {
+                background-color: #ffffff !important;
+            }
+            [data-baseweb="menu"] li {
+                background-color: #ffffff !important;
+                color: #262730 !important;
+            }
+            [data-baseweb="menu"] li:hover {
+                background-color: #f0f2f6 !important;
+            }
+            /* Expander */
+            .streamlit-expanderHeader {
+                background-color: #f0f2f6;
+                color: #262730;
+            }
+            /* Captions */
+            .stCaption {
+                color: #555555;
+            }
+            /* Radio buttons */
+            .stRadio label {
+                color: #262730 !important;
+            }
+            /* Checkboxes */
+            .stCheckbox label {
+                color: #262730 !important;
+            }
+            /* Sliders */
+            .stSlider label {
+                color: #262730 !important;
+            }
+            .stSlider [data-baseweb="slider"] div {
+                color: #262730 !important;
+            }
+            /* Buttons - ensure visible in light mode */
+            .stButton button {
+                background-color: #f0f2f6 !important;
+                color: #262730 !important;
+                border: 1px solid #d0d0d0 !important;
+            }
+            .stButton button:hover {
+                background-color: #e0e2e6 !important;
+                border-color: #b0b0b0 !important;
+            }
+            /* Primary buttons */
+            .stButton button[kind="primary"] {
+                background-color: #ff4b4b !important;
+                color: #ffffff !important;
+                border: none !important;
+            }
+            .stButton button[kind="primary"]:hover {
+                background-color: #ff3333 !important;
+            }
+            /* Secondary buttons */
+            .stButton button[kind="secondary"] {
+                background-color: #ffffff !important;
+                color: #262730 !important;
+                border: 1px solid #d0d0d0 !important;
+            }
+            /* Toggle */
+            .stToggle label {
+                color: #262730 !important;
+            }
+            /* DataFrame cells - ensure text is dark */
+            [data-testid="stDataFrame"] td {
+                color: #262730 !important;
+            }
+            [data-testid="stDataFrame"] th {
+                color: #262730 !important;
+                background-color: #f0f2f6 !important;
+            }
+            /* DataFrame styling for spreadsheet view */
+            .dataframe {
+                background-color: #ffffff !important;
+            }
+            .dataframe td, .dataframe th {
+                color: #262730 !important;
+            }
+            /* Tables in markdown */
+            table {
+                background-color: #ffffff !important;
+            }
+            table td, table th {
+                color: #262730 !important;
+                border-color: #d0d0d0 !important;
+            }
+        </style>
+        """, unsafe_allow_html=True)
 
 
 def render_scenarios_tab():
@@ -627,9 +940,15 @@ def render_inputs_form(prefix: str = "", is_mixed_income: bool = False):
         "construction_months": 24,
         "leaseup_months": 12,
         "operations_months": 60,
-        "land_cost_per_acre": 1_000_000,
-        "hard_cost_per_unit": 155_000,
+        "land_cost": 3_000_000,
+        "hard_cost_per_unit": 175_000,
         "soft_cost_pct": 30.0,
+        "hard_cost_contingency_pct": 5.0,
+        "soft_cost_contingency_pct": 5.0,
+        "developer_fee_pct": 4.0,
+        "predevelopment_cost_pct": 9.72,
+        "operating_reserve_months": 3,
+        "leaseup_reserve_months": 6,
         "vacancy_rate_pct": 6.0,
         "leaseup_pace_pct": 8.0,
         "opex_utilities": 1_200,
@@ -663,26 +982,41 @@ def render_inputs_form(prefix: str = "", is_mixed_income: bool = False):
     with col1:
         st.subheader("Timing")
         st.number_input("Predevelopment (months)", min_value=6, max_value=36,
-                       value=st.session_state[key("predevelopment_months")],
                        key=key("predevelopment_months"))
         st.number_input("Construction (months)", min_value=12, max_value=48,
-                       value=st.session_state[key("construction_months")],
                        key=key("construction_months"))
         st.number_input("Lease-up (months)", min_value=6, max_value=24,
-                       value=st.session_state[key("leaseup_months")],
                        key=key("leaseup_months"))
         st.number_input("Operations (months)", min_value=12, max_value=120,
-                       value=st.session_state[key("operations_months")],
                        key=key("operations_months"))
 
         st.subheader("Land & Construction")
-        currency_input("Land Cost/Acre", key("land_cost_per_acre"),
-                      st.session_state[key("land_cost_per_acre")], 100_000, 10_000_000)
+        currency_input("Land Cost (Total)", key("land_cost"),
+                      st.session_state[key("land_cost")], 500_000, 20_000_000)
         currency_input("Hard Cost/Unit", key("hard_cost_per_unit"),
                       st.session_state[key("hard_cost_per_unit")], 100_000, 500_000)
         st.slider("Soft Cost % (of hard costs)", min_value=0.0, max_value=60.0, step=1.0,
                  key=key("soft_cost_pct"), format="%.0f%%",
                  help="As percentage of hard costs")
+
+        st.subheader("Contingencies & Fees")
+        st.slider("Hard Cost Contingency", min_value=0.0, max_value=15.0, step=0.5,
+                 key=key("hard_cost_contingency_pct"), format="%.1f%%")
+        st.slider("Soft Cost Contingency", min_value=0.0, max_value=15.0, step=0.5,
+                 key=key("soft_cost_contingency_pct"), format="%.1f%%")
+        st.slider("Predevelopment (% of Hard)", min_value=0.0, max_value=20.0, step=0.1,
+                 key=key("predevelopment_cost_pct"), format="%.1f%%",
+                 help="Design, entitlement, and other costs before construction")
+        st.slider("Developer Fee (% of Hard)", min_value=0.0, max_value=10.0, step=0.5,
+                 key=key("developer_fee_pct"), format="%.1f%%")
+
+        st.subheader("Reserves")
+        st.number_input("Operating Reserve (months)", min_value=0, max_value=12,
+                       key=key("operating_reserve_months"),
+                       help="Months of operating expenses held in reserve")
+        st.number_input("Lease-up Reserve (months)", min_value=0, max_value=12,
+                       key=key("leaseup_reserve_months"),
+                       help="Months of debt service held in reserve during lease-up")
 
     with col2:
         st.subheader("Operations")
@@ -724,10 +1058,7 @@ def render_inputs_form(prefix: str = "", is_mixed_income: bool = False):
         st.slider("Perm Rate", min_value=0.0, max_value=18.0, step=0.5,
                  key=key("perm_rate_pct"), format="%.1f%%")
         amort_options = [15, 20, 25, 30]
-        amort_value = st.session_state[key("perm_amort_years")]
-        amort_index = amort_options.index(amort_value) if amort_value in amort_options else 1
         st.selectbox("Perm Amortization", amort_options,
-                    index=amort_index,
                     key=key("perm_amort_years"), format_func=lambda x: f"{x} years")
         st.slider("Max LTV", min_value=0.0, max_value=90.0, step=5.0,
                  key=key("perm_ltv_max_pct"), format="%.0f%%")
@@ -953,7 +1284,9 @@ def _initialize_mixed_income_inputs():
     # List of keys to copy from market rate to mixed income
     keys_to_copy = [
         "predevelopment_months", "construction_months", "leaseup_months", "operations_months",
-        "land_cost_per_acre", "hard_cost_per_unit", "soft_cost_pct",
+        "land_cost", "hard_cost_per_unit", "soft_cost_pct",
+        "predevelopment_cost_pct", "hard_cost_contingency_pct", "soft_cost_contingency_pct",
+        "developer_fee_pct", "operating_reserve_months", "leaseup_reserve_months",
         "vacancy_rate_pct", "leaseup_pace_pct",
         "opex_utilities", "opex_maintenance", "opex_management_pct",
         "market_rent_growth_pct", "opex_growth_pct", "property_tax_growth_pct",
@@ -1044,7 +1377,7 @@ def render_single_project_results(metrics, result, scenario_name: str = "Project
 
     import plotly.graph_objects as go
 
-    cfs = [cf.levered_cf for cf in result.monthly_cash_flows]
+    cfs = [cf.levered_cf for cf in result.periods]
     months = list(range(1, len(cfs) + 1))
 
     fig = go.Figure()
@@ -1070,7 +1403,6 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
     """Render the results comparison tab with granular developer metrics."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
-    from src.calculations.dcf import Phase
 
     # IRR Difference callout
     irr_diff = comparison.irr_difference_bps
@@ -1158,34 +1490,34 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
 
     # Helper function to calculate metrics from cash flows
     def calc_developer_metrics(result, metrics, label):
-        """Calculate detailed developer metrics from DCF result."""
-        cfs = result.monthly_cash_flows
+        """Calculate detailed developer metrics from DetailedCashFlowResult."""
+        periods = result.periods
         total_units = metrics.total_units if hasattr(metrics, 'total_units') else st.session_state.get("target_units", 200)
 
-        # Separate cash flows by phase
-        predev_cfs = [cf for cf in cfs if cf.phase == Phase.PREDEVELOPMENT]
-        construction_cfs = [cf for cf in cfs if cf.phase == Phase.CONSTRUCTION]
-        leaseup_cfs = [cf for cf in cfs if cf.phase == Phase.LEASEUP]
-        ops_cfs = [cf for cf in cfs if cf.phase == Phase.OPERATIONS]
-        reversion_cf = [cf for cf in cfs if cf.phase == Phase.REVERSION]
+        # Separate periods by phase (using header flags)
+        predev_periods = [p for p in periods if p.header.is_predevelopment]
+        construction_periods = [p for p in periods if p.header.is_construction]
+        leaseup_periods = [p for p in periods if p.header.is_leaseup]
+        ops_periods = [p for p in periods if p.header.is_operations and not p.header.is_reversion]
+        reversion_period = [p for p in periods if p.header.is_reversion]
 
-        # Total equity invested (sum of equity contributions)
-        total_equity_invested = sum(cf.equity_contribution for cf in cfs if cf.equity_contribution > 0)
+        # Total equity invested (sum of equity draws - negative values are outflows)
+        total_equity_invested = abs(sum(p.equity.equity_drawn for p in periods if p.equity.equity_drawn < 0))
 
         # Total operating cash flows (levered)
-        total_ops_levered_cf = sum(cf.levered_cf for cf in ops_cfs + leaseup_cfs)
+        total_ops_levered_cf = sum(p.levered_cf for p in ops_periods + leaseup_periods)
 
         # Reversion proceeds
-        reversion_proceeds = reversion_cf[0].levered_cf if reversion_cf else 0
+        reversion_proceeds = reversion_period[0].levered_cf if reversion_period else 0
 
         # Total returns to equity
         total_returns = total_ops_levered_cf + reversion_proceeds
 
         # Cash-on-cash by year (annualized operating cash flows)
         ops_cash_by_year = {}
-        for cf in ops_cfs + leaseup_cfs:
-            year = (cf.month - 1) // 12 + 1
-            ops_cash_by_year[year] = ops_cash_by_year.get(year, 0) + cf.levered_cf
+        for p in ops_periods + leaseup_periods:
+            year = (p.header.period - 1) // 12 + 1
+            ops_cash_by_year[year] = ops_cash_by_year.get(year, 0) + p.levered_cf
 
         # Average annual cash-on-cash during operations
         if ops_cash_by_year and total_equity_invested > 0:
@@ -1195,9 +1527,9 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
 
         # DSCR calculations (during operations only)
         dscr_values = []
-        for cf in ops_cfs:
-            if cf.perm_debt_service > 0:
-                dscr = cf.noi / cf.perm_debt_service
+        for p in ops_periods:
+            if p.permanent_debt.pmt_in_period > 0:
+                dscr = p.operations.noi / p.permanent_debt.pmt_in_period
                 dscr_values.append(dscr)
 
         avg_dscr = sum(dscr_values) / len(dscr_values) if dscr_values else 0
@@ -1221,13 +1553,13 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
         import numpy_financial as npf
 
         # Build full levered cash flow series
-        full_levered_cfs = [cf.levered_cf for cf in cfs]
+        full_levered_cfs = [p.levered_cf for p in periods]
 
         # Operations-only IRR: all cash flows except reversion
         # Replace reversion month with 0 to isolate operations contribution
         ops_only_cfs = full_levered_cfs.copy()
-        if reversion_cf:
-            rev_month_idx = len(cfs) - 1  # Reversion is last month
+        if reversion_period:
+            rev_month_idx = len(periods) - 1  # Reversion is last month
             ops_only_cfs[rev_month_idx] = 0
 
         try:
@@ -1239,13 +1571,13 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
         # Reversion-only IRR: equity contributions + reversion only (no operating cash flows)
         # Zero out all operating period positive cash flows
         rev_only_cfs = []
-        for i, cf in enumerate(cfs):
-            if cf.phase in [Phase.PREDEVELOPMENT, Phase.CONSTRUCTION]:
+        for p in periods:
+            if p.header.is_predevelopment or p.header.is_construction:
                 # Keep equity contributions (negative cash flows during development)
-                rev_only_cfs.append(cf.levered_cf)
-            elif cf.phase == Phase.REVERSION:
+                rev_only_cfs.append(p.levered_cf)
+            elif p.header.is_reversion:
                 # Keep reversion
-                rev_only_cfs.append(cf.levered_cf)
+                rev_only_cfs.append(p.levered_cf)
             else:
                 # Zero out lease-up and operations
                 rev_only_cfs.append(0)
@@ -1290,10 +1622,10 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
             "debt": debt,
             "equity": equity,
             "ops_cash_by_year": ops_cash_by_year,
-            "ops_cfs": ops_cfs,
-            "leaseup_cfs": leaseup_cfs,
-            "reversion_cf": reversion_cf,
-            "all_cfs": cfs,
+            "ops_periods": ops_periods,
+            "leaseup_periods": leaseup_periods,
+            "reversion_period": reversion_period,
+            "all_periods": periods,
             # IRR bifurcation
             "ops_only_irr": ops_only_irr,
             "rev_only_irr": rev_only_irr,
@@ -1640,12 +1972,12 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
         st.caption("Excludes reversion period to show operational detail")
 
         # Get operations-only cash flows (exclude reversion)
-        market_ops_cfs = market_dev['leaseup_cfs'] + market_dev['ops_cfs']
-        mixed_ops_cfs = mixed_dev['leaseup_cfs'] + mixed_dev['ops_cfs']
+        market_ops_periods = market_dev['leaseup_periods'] + market_dev['ops_periods']
+        mixed_ops_periods = mixed_dev['leaseup_periods'] + mixed_dev['ops_periods']
 
-        market_ops_levered = [cf.levered_cf for cf in market_ops_cfs]
-        mixed_ops_levered = [cf.levered_cf for cf in mixed_ops_cfs]
-        ops_months = [cf.month for cf in market_ops_cfs]
+        market_ops_levered = [p.levered_cf for p in market_ops_periods]
+        mixed_ops_levered = [p.levered_cf for p in mixed_ops_periods]
+        ops_months = [p.header.period for p in market_ops_periods]
 
         fig_ops = go.Figure()
         fig_ops.add_trace(go.Scatter(
@@ -1713,28 +2045,38 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
 
         with col1:
             st.markdown("**Market Rate**")
-            if market_dev['reversion_cf']:
-                rev_cf = market_dev['reversion_cf'][0]
-                st.metric("Sale Proceeds", f"${rev_cf.sale_proceeds:,.0f}")
-                st.metric("Loan Payoff", f"${rev_cf.loan_payoff:,.0f}")
-                st.metric("Net to Equity", f"${rev_cf.net_sale_proceeds:,.0f}")
+            if market_dev['reversion_period']:
+                rev_p = market_dev['reversion_period'][0]
+                sale_proceeds = rev_p.investment.reversion
+                loan_payoff = rev_p.permanent_debt.payoff
+                net_to_equity = rev_p.levered_cf
+                st.metric("Sale Proceeds", f"${sale_proceeds:,.0f}")
+                st.metric("Loan Payoff", f"${loan_payoff:,.0f}")
+                st.metric("Net to Equity", f"${net_to_equity:,.0f}")
 
         with col2:
             st.markdown("**Mixed Income**")
-            if mixed_dev['reversion_cf']:
-                rev_cf = mixed_dev['reversion_cf'][0]
-                market_rev = market_dev['reversion_cf'][0] if market_dev['reversion_cf'] else None
+            if mixed_dev['reversion_period']:
+                rev_p = mixed_dev['reversion_period'][0]
+                sale_proceeds = rev_p.investment.reversion
+                loan_payoff = rev_p.permanent_debt.payoff
+                net_to_equity = rev_p.levered_cf
 
-                sale_diff = rev_cf.sale_proceeds - (market_rev.sale_proceeds if market_rev else 0)
-                st.metric("Sale Proceeds", f"${rev_cf.sale_proceeds:,.0f}",
+                market_rev = market_dev['reversion_period'][0] if market_dev['reversion_period'] else None
+                market_sale = market_rev.investment.reversion if market_rev else 0
+                market_payoff = market_rev.permanent_debt.payoff if market_rev else 0
+                market_net = market_rev.levered_cf if market_rev else 0
+
+                sale_diff = sale_proceeds - market_sale
+                st.metric("Sale Proceeds", f"${sale_proceeds:,.0f}",
                          delta=f"${sale_diff:+,.0f}")
 
-                payoff_diff = rev_cf.loan_payoff - (market_rev.loan_payoff if market_rev else 0)
-                st.metric("Loan Payoff", f"${rev_cf.loan_payoff:,.0f}",
+                payoff_diff = loan_payoff - market_payoff
+                st.metric("Loan Payoff", f"${loan_payoff:,.0f}",
                          delta=f"${payoff_diff:+,.0f}", delta_color="inverse")
 
-                net_diff = rev_cf.net_sale_proceeds - (market_rev.net_sale_proceeds if market_rev else 0)
-                st.metric("Net to Equity", f"${rev_cf.net_sale_proceeds:,.0f}",
+                net_diff = net_to_equity - market_net
+                st.metric("Net to Equity", f"${net_to_equity:,.0f}",
                          delta=f"${net_diff:+,.0f}")
 
         # Reversion vs TDC comparison
@@ -1745,8 +2087,8 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
         scenarios = ['Market Rate', 'Mixed Income']
         tdc_values = [market_dev['tdc'], mixed_dev['tdc']]
 
-        market_sale = market_dev['reversion_cf'][0].sale_proceeds if market_dev['reversion_cf'] else 0
-        mixed_sale = mixed_dev['reversion_cf'][0].sale_proceeds if mixed_dev['reversion_cf'] else 0
+        market_sale = market_dev['reversion_period'][0].investment.reversion if market_dev['reversion_period'] else 0
+        mixed_sale = mixed_dev['reversion_period'][0].investment.reversion if mixed_dev['reversion_period'] else 0
         sale_values = [market_sale, mixed_sale]
 
         fig_exit.add_trace(go.Bar(
@@ -1789,7 +2131,7 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
         st.markdown(f"- Construction: Months {predev_months+1}-{predev_months+const_months}")
         st.markdown(f"- Lease-up: Months {predev_months+const_months+1}-{predev_months+const_months+leaseup_months}")
         st.markdown(f"- Operations: Months {predev_months+const_months+leaseup_months+1}-{total_months}")
-        st.markdown(f"- **Equity invested at Month {predev_months+1}** (construction start)")
+        st.markdown("- **Equity invested first** (land at Month 1, then soft costs through predevelopment, then construction until exhausted)")
 
         st.divider()
 
@@ -1806,11 +2148,11 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
             st.markdown(f"**Annual NOI:** ${market_metrics.noi_annual:,.0f}")
             st.markdown(f"**Yield on Cost:** {market_metrics.yield_on_cost:.2%}")
             st.divider()
-            if market_dev['reversion_cf']:
-                rev = market_dev['reversion_cf'][0]
-                st.markdown(f"**Sale Price:** ${rev.sale_proceeds:,.0f}")
-                st.markdown(f"**Loan Payoff:** ${rev.loan_payoff:,.0f}")
-                st.markdown(f"**Net to Equity:** ${rev.net_sale_proceeds:,.0f}")
+            if market_dev['reversion_period']:
+                rev = market_dev['reversion_period'][0]
+                st.markdown(f"**Sale Price:** ${rev.investment.reversion:,.0f}")
+                st.markdown(f"**Loan Payoff:** ${rev.permanent_debt.payoff:,.0f}")
+                st.markdown(f"**Net to Equity:** ${rev.levered_cf:,.0f}")
             st.divider()
             st.markdown(f"**Levered IRR:** {market_metrics.levered_irr:.2%}")
             st.markdown(f"**Unlevered IRR:** {market_metrics.unlevered_irr:.2%}")
@@ -1826,11 +2168,11 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
             st.markdown(f"**Annual NOI:** ${mixed_metrics.noi_annual:,.0f}")
             st.markdown(f"**Yield on Cost:** {mixed_metrics.yield_on_cost:.2%}")
             st.divider()
-            if mixed_dev['reversion_cf']:
-                rev = mixed_dev['reversion_cf'][0]
-                st.markdown(f"**Sale Price:** ${rev.sale_proceeds:,.0f}")
-                st.markdown(f"**Loan Payoff:** ${rev.loan_payoff:,.0f}")
-                st.markdown(f"**Net to Equity:** ${rev.net_sale_proceeds:,.0f}")
+            if mixed_dev['reversion_period']:
+                rev = mixed_dev['reversion_period'][0]
+                st.markdown(f"**Sale Price:** ${rev.investment.reversion:,.0f}")
+                st.markdown(f"**Loan Payoff:** ${rev.permanent_debt.payoff:,.0f}")
+                st.markdown(f"**Net to Equity:** ${rev.levered_cf:,.0f}")
             st.divider()
             st.markdown(f"**Levered IRR:** {mixed_metrics.levered_irr:.2%}")
             st.markdown(f"**Unlevered IRR:** {mixed_metrics.unlevered_irr:.2%}")
@@ -1840,17 +2182,17 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
 
         # Show monthly CF summary
         ops_start = predev_months + const_months + leaseup_months + 1
-        market_ops = [cf for cf in market_result.monthly_cash_flows if cf.phase.value == "operations"][:60]
-        mixed_ops = [cf for cf in mixed_result.monthly_cash_flows if cf.phase.value == "operations"][:60]
+        market_ops = [p for p in market_result.periods if p.header.is_operations and not p.header.is_reversion][:60]
+        mixed_ops = [p for p in mixed_result.periods if p.header.is_operations and not p.header.is_reversion][:60]
 
         if market_ops:
             # Annual totals
             market_annual = {}
             mixed_annual = {}
-            for i, (m_cf, x_cf) in enumerate(zip(market_ops, mixed_ops)):
+            for i, (m_p, x_p) in enumerate(zip(market_ops, mixed_ops)):
                 year = i // 12 + 1
-                market_annual[year] = market_annual.get(year, 0) + m_cf.levered_cf
-                mixed_annual[year] = mixed_annual.get(year, 0) + x_cf.levered_cf
+                market_annual[year] = market_annual.get(year, 0) + m_p.levered_cf
+                mixed_annual[year] = mixed_annual.get(year, 0) + x_p.levered_cf
 
             cf_data = {
                 "Year": list(market_annual.keys()),
@@ -1859,10 +2201,11 @@ def render_results_tab(market_metrics, mixed_metrics, comparison, market_result,
             }
             st.dataframe(pd.DataFrame(cf_data), use_container_width=True, hide_index=True)
 
-        st.warning("""
-        **Known Issue:** Equity is currently invested at construction start (Month 19 with default timing),
-        not at Month 1 when land is typically acquired. This delays the cash outflow and inflates IRR.
-        Excel models typically invest equity at Month 1 or split between land (Month 1) and construction.
+        st.info("""
+        **Equity Draw Waterfall:** Equity is drawn first starting at Month 1 (land acquisition),
+        then soft costs through predevelopment, then construction costs until exhausted.
+        Debt kicks in only after equity is fully deployed. This matches standard real estate
+        development funding where sponsor equity is drawn down first to protect lender.
         """)
 
 
@@ -2010,101 +2353,28 @@ def render_matrix_tab(inputs: ProjectInputs):
 
 
 def render_detailed_cashflow_tab(inputs: ProjectInputs):
-    """Render the detailed cash flow tab with separate Market Rate and Mixed Income views."""
+    """Render the detailed cash flow tab with separate Market Rate and Mixed Income views.
+
+    Uses the cached results from run_analysis() - the SINGLE SOURCE OF TRUTH.
+    No recalculation or overriding needed since calculate_deal() already computed
+    all periods and derived metrics.
+    """
     st.subheader("Detailed Cash Flow Analysis")
 
-    # Calculate common inputs
-    total_gsf = sum(
-        inputs.unit_mix[ut].gsf * inputs.unit_mix[ut].allocation
-        for ut in inputs.unit_mix
-    )
-    hard_costs = inputs.target_units * inputs.hard_cost_per_unit
-    annual_opex_per_unit = inputs.opex_utilities + inputs.opex_maintenance + inputs.opex_misc
+    # Get cached results from run_analysis (single source of truth)
+    # These are DetailedCashFlowResult objects with full period data
+    market_result = st.session_state.get("_cached_market_result")
+    mixed_result = st.session_state.get("_cached_mixed_result")
 
-    # Get capital stack from session state
-    mezzanine_debt = st.session_state.get("mezzanine_debt", 0)
-    mezzanine_rate = st.session_state.get("mezzanine_rate_pct", 12.0) / 100
-    preferred_equity = st.session_state.get("preferred_equity", 0)
-    preferred_return = st.session_state.get("preferred_return_pct", 10.0) / 100
+    if not market_result or not mixed_result:
+        st.warning("Calculating results... Please wait.")
+        return
 
-    # Get TIF lump sum from Property Tax tab calculation
+    # Get TIF lump sum for display
     tif_lump_sum = st.session_state.get("calculated_tif_lump_sum", 0)
-
-    # Common parameters for cash flow generation
-    common_params = {
-        "land_cost": inputs.land_cost_per_acre,
-        "hard_costs": hard_costs,
-        "soft_cost_pct": inputs.soft_cost_pct,
-        "construction_ltc": inputs.construction_ltc,
-        "construction_rate": inputs.construction_rate,
-        "start_date": inputs.predevelopment_start,
-        "predevelopment_months": inputs.predevelopment_months,
-        "construction_months": inputs.construction_months,
-        "leaseup_months": inputs.leaseup_months,
-        "operations_months": inputs.operations_months,
-        "vacancy_rate": inputs.vacancy_rate,
-        "leaseup_pace": inputs.leaseup_pace,
-        "max_occupancy": inputs.max_occupancy,
-        "annual_opex_per_unit": annual_opex_per_unit,
-        "total_units": inputs.target_units,
-        "existing_assessed_value": inputs.existing_assessed_value,
-        "market_rent_growth": inputs.market_rent_growth,
-        "opex_growth": inputs.opex_growth,
-        "prop_tax_growth": inputs.property_tax_growth,
-        "perm_rate": inputs.perm_rate,
-        "perm_amort_years": inputs.perm_amort_years,
-        "perm_ltv_max": inputs.perm_ltv_max,
-        "perm_dscr_min": inputs.perm_dscr_min,
-        "exit_cap_rate": inputs.exit_cap_rate,
-        "reserves_pct": inputs.reserves_pct,
-        "mezzanine_amount": mezzanine_debt,
-        "mezzanine_rate": mezzanine_rate,
-        "mezzanine_io": True,
-        "preferred_amount": preferred_equity,
-        "preferred_return": preferred_return,
-    }
+    tif_enabled = st.session_state.get("tif_lump_sum", True)
 
     try:
-        # Calculate market rate GPR (100% market rents)
-        market_monthly_gpr = inputs.target_units * total_gsf * inputs.market_rent_psf
-
-        # Calculate mixed income GPR (blended market + affordable)
-        affordable_pct = st.session_state.get("affordable_pct", 20.0)
-        if affordable_pct > 1:
-            affordable_pct = affordable_pct / 100
-        # Estimate affordable rent discount (typically 60-70% of market)
-        affordable_rent_discount = 0.65
-        mixed_monthly_gpr = market_monthly_gpr * (1 - affordable_pct * (1 - affordable_rent_discount))
-
-        # Generate MARKET RATE cash flow (no incentives)
-        market_result = generate_detailed_cash_flow(
-            **common_params,
-            monthly_gpr_at_stabilization=market_monthly_gpr,
-            affordable_pct=0.0,  # No affordable units
-            tif_treatment="none",
-            tif_lump_sum=0,
-            tif_abatement_pct=0,
-            tif_abatement_years=0,
-            tif_stream_pct=0,
-            tif_stream_years=0,
-            tif_start_delay_months=0,
-        )
-
-        # Generate MIXED INCOME cash flow (with incentives)
-        tif_treatment = _get_tif_treatment_str()
-        mixed_result = generate_detailed_cash_flow(
-            **common_params,
-            monthly_gpr_at_stabilization=mixed_monthly_gpr,
-            affordable_pct=affordable_pct,
-            tif_treatment=tif_treatment,
-            tif_lump_sum=tif_lump_sum if tif_treatment == "lump_sum" else 0,
-            tif_abatement_pct=st.session_state.get("abate_pct", 100) / 100 if tif_treatment == "abatement" else 0,
-            tif_abatement_years=st.session_state.get("abate_term", 15) if tif_treatment == "abatement" else 0,
-            tif_stream_pct=st.session_state.get("scenario_b_stream_pct", 100) / 100 if tif_treatment == "stream" else 0,
-            tif_stream_years=st.session_state.get("scenario_b_stream_years", 20) if tif_treatment == "stream" else 0,
-            tif_start_delay_months=st.session_state.get("scenario_b_tif_delay", 0),
-        )
-
         # =====================================================================
         # COMPARISON OPERATING STATEMENT
         # =====================================================================
@@ -2126,6 +2396,7 @@ def render_detailed_cashflow_tab(inputs: ProjectInputs):
                 inputs=inputs,
                 has_incentives=False,
                 tif_lump_sum=0,
+                key_prefix="detailed_market",
             )
 
         with cf_tab2:
@@ -2134,11 +2405,12 @@ def render_detailed_cashflow_tab(inputs: ProjectInputs):
                 scenario_name="Mixed Income",
                 inputs=inputs,
                 has_incentives=True,
-                tif_lump_sum=tif_lump_sum if tif_treatment == "lump_sum" else 0,
+                tif_lump_sum=tif_lump_sum if tif_enabled else 0,
+                key_prefix="detailed_mixed",
             )
 
     except Exception as e:
-        st.error(f"Error generating detailed cash flow: {e}")
+        st.error(f"Error rendering detailed cash flow: {e}")
         import traceback
         st.code(traceback.format_exc())
 
@@ -2250,7 +2522,8 @@ def _render_operating_statement_comparison(market_result, mixed_result, total_un
 
 
 def _render_scenario_cashflow(result, scenario_name: str, inputs: ProjectInputs,
-                              has_incentives: bool, tif_lump_sum: float):
+                              has_incentives: bool, tif_lump_sum: float,
+                              key_prefix: str = "detailed"):
     """Render detailed cash flow for a single scenario."""
     # Calculate equity multiple
     total_equity_out = abs(sum(p.levered_cf for p in result.periods if p.levered_cf < 0))
@@ -2275,7 +2548,7 @@ def _render_scenario_cashflow(result, scenario_name: str, inputs: ProjectInputs,
 
     # Sources & Uses with Drawdown Schedule
     st.markdown("#### Sources & Uses")
-    render_sources_uses(result.sources_uses)
+    render_sources_uses(result.sources_uses, key_prefix=key_prefix)
 
     st.divider()
 
@@ -2307,22 +2580,42 @@ def _render_scenario_cashflow(result, scenario_name: str, inputs: ProjectInputs,
     )
 
     # Render detailed cash flow table
-    render_detailed_cashflow_table(result, aggregation=aggregation)
+    is_mixed = scenario_name.lower() == "mixed income"
+    render_detailed_cashflow_table(
+        result,
+        aggregation=aggregation,
+        is_mixed_income=is_mixed,
+        tif_lump_sum=tif_lump_sum if has_incentives and is_mixed else 0.0
+    )
 
     st.divider()
 
     # Exit waterfall
     render_exit_waterfall(result)
 
-    # Export button
-    csv_data = export_cashflow_to_csv(result)
-    st.download_button(
-        label=f"Export {scenario_name} CSV",
-        data=csv_data,
-        file_name=f"cashflow_{scenario_name.lower().replace(' ', '_')}.csv",
-        mime="text/csv",
-        key=f"export_{scenario_name.lower().replace(' ', '_')}",
-    )
+    # Export buttons
+    st.markdown("#### Export Data")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        csv_data = export_cashflow_to_csv(result)
+        st.download_button(
+            label=f"📄 Export {scenario_name} CSV",
+            data=csv_data,
+            file_name=f"cashflow_{scenario_name.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+            key=f"export_csv_{scenario_name.lower().replace(' ', '_')}",
+        )
+
+    with col2:
+        xlsx_data = export_cashflow_to_excel(result, scenario_name)
+        st.download_button(
+            label=f"📊 Export {scenario_name} Excel",
+            data=xlsx_data,
+            file_name=f"cashflow_{scenario_name.lower().replace(' ', '_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"export_xlsx_{scenario_name.lower().replace(' ', '_')}",
+        )
 
 
 def _render_drawdown_schedule(result, tif_lump_sum: float):
@@ -2351,11 +2644,11 @@ def _render_drawdown_schedule(result, tif_lump_sum: float):
     # Group by quarter for readability
     quarters = {}
     for p in periods:
-        if p.period <= (result.construction_months + result.predevelopment_months if hasattr(result, 'construction_months') else 36):
-            q = (p.period - 1) // 3 + 1
+        if p.header.period <= result.construction_end:
+            q = (p.header.period - 1) // 3 + 1
             if q not in quarters:
                 quarters[q] = {"uses": 0, "periods": []}
-            quarters[q]["uses"] += abs(min(0, p.unlevered_cf))
+            quarters[q]["uses"] += abs(min(0, p.investment.unlevered_cf))
             quarters[q]["periods"].append(p)
 
     # Simplified drawdown logic
@@ -2437,20 +2730,20 @@ def _render_performance_metrics(result):
     years_seen = set()
 
     for p in periods:
-        year = p.period // 12 + 1
+        year = p.header.period // 12 + 1
         if year in years_seen or year > 10:  # Show max 10 years
             continue
 
         # Find all periods in this year
-        year_periods = [per for per in periods if per.period // 12 + 1 == year]
+        year_periods = [per for per in periods if per.header.period // 12 + 1 == year]
         if not year_periods:
             continue
 
         years_seen.add(year)
 
         # Annual metrics
-        annual_noi = sum(per.noi for per in year_periods)
-        annual_ds = sum(per.debt_service for per in year_periods)
+        annual_noi = sum(per.operations.noi for per in year_periods)
+        annual_ds = sum(per.permanent_debt.pmt_in_period for per in year_periods)
         annual_cf = sum(per.levered_cf for per in year_periods)
 
         # DSCR = NOI / Debt Service
@@ -2460,7 +2753,7 @@ def _render_performance_metrics(result):
         coc = annual_cf / total_equity if total_equity > 0 else 0
 
         # Cumulative metrics for ROI/ROE
-        cumulative_cf = sum(per.levered_cf for per in periods if per.period <= year_periods[-1].period)
+        cumulative_cf = sum(per.levered_cf for per in periods if per.header.period <= year_periods[-1].header.period)
 
         metrics_data.append({
             "Year": year,
@@ -2521,7 +2814,7 @@ def render_property_tax_tab(inputs: ProjectInputs):
     # Calculate TDC (Total Development Cost)
     hard_costs = inputs.target_units * inputs.hard_cost_per_unit
     soft_costs = hard_costs * inputs.soft_cost_pct
-    land_cost = inputs.land_cost_per_acre  # Simplified: 1 acre
+    land_cost = inputs.land_cost  # Simplified: 1 acre
 
     # Estimate IDC (Interest During Construction)
     construction_loan = (land_cost + hard_costs + soft_costs) * inputs.construction_ltc
@@ -2810,100 +3103,77 @@ The PV method shows the actual value of the increment stream.
 
 
 def render_sources_uses_tab(inputs: ProjectInputs):
-    """Render the detailed Sources & Uses tab."""
+    """Render the detailed Sources & Uses tab with scenario comparison."""
     st.subheader("Sources & Uses")
 
-    # Get construction type params for units_per_acre
-    from src.models.lookups import CONSTRUCTION_TYPE_PARAMS
-    ct_params = CONSTRUCTION_TYPE_PARAMS.get(inputs.construction_type)
-    units_per_acre = ct_params.units_per_acre if ct_params else 66
+    # Scenario tabs - same pattern as Detailed Cash Flows
+    su_tab1, su_tab2 = st.tabs(["Market Rate", "Mixed Income"])
 
-    # Calculate total GSF
-    total_gsf = 0
-    for ut, entry in inputs.unit_mix.items():
-        units_of_type = round(inputs.target_units * entry.allocation)
-        total_gsf += entry.gsf * units_of_type
+    with su_tab1:
+        _render_sources_uses_for_scenario(inputs, is_mixed_income=False)
 
-    # Render inputs section
-    su_inputs = render_sources_uses_inputs()
+    with su_tab2:
+        _render_sources_uses_for_scenario(inputs, is_mixed_income=True)
 
-    st.divider()
 
-    # Determine land cost method and values
-    land_method = su_inputs.get("land_cost_method", LandCostMethod.PER_ACRE)
-    land_direct = su_inputs.get("land_direct", 0)
-    land_per_acre = inputs.land_cost_per_acre
+def _render_sources_uses_for_scenario(inputs: ProjectInputs, is_mixed_income: bool):
+    """Render Sources & Uses for a single scenario.
 
-    # Calculate monthly opex for reserves
-    monthly_opex = (
-        inputs.opex_utilities +
-        inputs.opex_maintenance +
-        inputs.opex_misc
-    ) / 12 * inputs.target_units
+    IMPORTANT: Uses cached results from calculate_deal() for consistency.
+    No duplicate calculations - reads from the SINGLE SOURCE OF TRUTH.
+    """
+    scenario_name = "Mixed Income" if is_mixed_income else "Market Rate"
+    key_prefix = "mixed_" if is_mixed_income else "market_"
 
-    # Estimate monthly debt service for lease-up reserve
-    # (rough estimate based on construction loan)
-    hard_costs = su_inputs.get("hard_cost_per_unit", inputs.hard_cost_per_unit) * inputs.target_units
-    soft_costs = hard_costs * su_inputs.get("soft_cost_pct", inputs.soft_cost_pct)
-    estimated_tdc = hard_costs + soft_costs + (land_direct if land_method == LandCostMethod.DIRECT else land_per_acre * (inputs.target_units / units_per_acre))
-    construction_loan = estimated_tdc * su_inputs.get("construction_ltc_cap", inputs.construction_ltc)
-    monthly_debt_service = construction_loan * (inputs.perm_rate / 12) * 1.5  # Rough P&I estimate
+    # Get cached result from the main calculation (SINGLE SOURCE OF TRUTH)
+    cache_key = "_cached_mixed_result" if is_mixed_income else "_cached_market_result"
+    cached_result = st.session_state.get(cache_key)
 
-    # Calculate detailed S&U
-    try:
-        su_detailed = calculate_sources_uses_detailed(
-            target_units=inputs.target_units,
-            total_gsf=total_gsf,
-            units_per_acre=units_per_acre,
+    if cached_result is None:
+        st.warning(f"No cached results for {scenario_name}. Please run the analysis first.")
+        return
 
-            # Land
-            land_cost_method=land_method,
-            land_direct=land_direct,
-            land_per_acre=land_per_acre,
+    # Extract SourcesUses from cached result
+    su = cached_result.sources_uses
 
-            # Hard costs
-            hard_cost_per_unit=su_inputs.get("hard_cost_per_unit", inputs.hard_cost_per_unit),
-            hard_cost_contingency_pct=su_inputs.get("hard_cost_contingency_pct", 0.05),
+    # Show scenario header
+    st.markdown(f"### {scenario_name}")
 
-            # Soft costs
-            soft_cost_pct_of_hard=su_inputs.get("soft_cost_pct", inputs.soft_cost_pct),
-            developer_fee_pct=su_inputs.get("developer_fee_pct", 0.04),
-            soft_cost_contingency_pct=su_inputs.get("soft_cost_contingency_pct", 0.05),
+    # Show incentives for mixed income
+    if is_mixed_income:
+        fee_waivers = 0.0
+        tif_lump_sum = 0.0
+        if inputs.incentive_config is not None:
+            if inputs.incentive_config.toggles.smart_fee_waiver:
+                affordable_units = round(inputs.target_units * inputs.affordable_pct)
+                fee_waivers = inputs.incentive_config.get_waiver_amount(affordable_units)
+            if inputs.incentive_config.toggles.tif_lump_sum:
+                tif_lump_sum = st.session_state.get("calculated_tif_lump_sum", 0)
 
-            # Financing
-            construction_ltc_cap=su_inputs.get("construction_ltc_cap", inputs.construction_ltc),
-            construction_rate=inputs.construction_rate,
-            construction_months=inputs.construction_months,
-            construction_loan_fee_pct=su_inputs.get("construction_loan_fee_pct", 0.01),
+        if fee_waivers > 0 or tif_lump_sum > 0:
+            incentives_msg = []
+            if fee_waivers > 0:
+                incentives_msg.append(f"SMART Fee Waiver: ${fee_waivers:,.0f}")
+            if tif_lump_sum > 0:
+                incentives_msg.append(f"TIF Lump Sum: ${tif_lump_sum:,.0f}")
+            st.success(f"**Incentives Applied:** {', '.join(incentives_msg)}")
 
-            # Reserves
-            monthly_opex=monthly_opex,
-            monthly_debt_service=monthly_debt_service,
-            operating_reserve_months=su_inputs.get("operating_reserve_months", 3),
-            leaseup_reserve_months=su_inputs.get("leaseup_reserve_months", 6),
+    # Render the simple SourcesUses table using cached data
+    # Uses render_sources_uses from detailed_cashflow_view which handles SourcesUses
+    render_sources_uses(su, key_prefix=key_prefix)
 
-            # Gap funding
-            tif_lump_sum=su_inputs.get("tif_lump_sum", 0),
-            grants=su_inputs.get("grants", 0),
-            fee_waivers=0,  # Calculated from incentives
-
-            # Mezzanine / preferred
-            mezzanine_debt=su_inputs.get("mezzanine_debt", 0),
-            mezzanine_rate=su_inputs.get("mezzanine_rate", 0.12),
-            preferred_equity=su_inputs.get("preferred_equity", 0),
-            preferred_return=su_inputs.get("preferred_return", 0.10),
-
-            # Deferred
-            deferred_developer_fee_pct=su_inputs.get("deferred_developer_fee_pct", 0),
-        )
-
-        # Render the detailed table
-        render_sources_uses_detailed_table(su_detailed)
-
-    except Exception as e:
-        st.error(f"Error calculating Sources & Uses: {e}")
-        import traceback
-        st.code(traceback.format_exc())
+    # Show per-unit metrics
+    st.markdown("#### Per-Unit Metrics")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        tdc_per_unit = su.tdc / inputs.target_units if inputs.target_units > 0 else 0
+        st.metric("TDC / Unit", f"${tdc_per_unit:,.0f}")
+    with col2:
+        equity_per_unit = su.equity / inputs.target_units if inputs.target_units > 0 else 0
+        st.metric("Equity / Unit", f"${equity_per_unit:,.0f}")
+    with col3:
+        loan_per_unit = su.construction_loan / inputs.target_units if inputs.target_units > 0 else 0
+        st.metric("Loan / Unit", f"${loan_per_unit:,.0f}")
 
 
 def render_monte_carlo_tab(inputs: ProjectInputs):
@@ -3191,7 +3461,7 @@ def render_monte_carlo_tab(inputs: ProjectInputs):
         gpr_result = calculate_gpr(allocations)
 
         base_inputs = BaseInputs(
-            land_cost=inputs.land_cost_per_acre * 2,  # Assuming 2 acres
+            land_cost=inputs.land_cost * 2,  # Assuming 2 acres
             hard_costs=inputs.hard_cost_per_unit * total_units,
             soft_cost_pct=inputs.soft_cost_pct,
             construction_ltc=inputs.construction_ltc,
@@ -3228,6 +3498,7 @@ def render_monte_carlo_tab(inputs: ProjectInputs):
             seed=seed,
             confidence_level=confidence_level,
             parallel=True,
+            use_unified_engine=True,  # Use calculate_deal() for consistency with main app
         )
 
         # Run with progress bar
@@ -3357,16 +3628,77 @@ def render_monte_carlo_tab(inputs: ProjectInputs):
             st.code(result.summary())
 
 
+def _precalculate_derived_values(inputs: ProjectInputs):
+    """Pre-calculate derived values so they're available to all tabs.
+
+    This runs on every rerun to keep values in sync with inputs.
+    IMPORTANT: TIF lump sum calculation uses the same session state keys
+    as the Property Tax tab to ensure consistency.
+    """
+    from src.calculations.property_tax import get_austin_tax_stack
+    from src.models.lookups import CONSTRUCTION_TYPE_PARAMS
+
+    # Get construction params
+    ct_params = CONSTRUCTION_TYPE_PARAMS.get(inputs.construction_type)
+    units_per_acre = ct_params.units_per_acre if ct_params else 66
+
+    # Estimate TDC for TIF calculation (used as default for tif_new_value_str)
+    hard_costs = inputs.hard_cost_per_unit * inputs.target_units
+    hard_costs_with_contingency = hard_costs * (1 + inputs.hard_cost_contingency_pct)
+    soft_costs = hard_costs_with_contingency * inputs.soft_cost_pct * (1 + inputs.soft_cost_contingency_pct)
+    predevelopment = hard_costs * inputs.predevelopment_cost_pct
+    land_cost = inputs.land_cost * (inputs.target_units / units_per_acre)
+    estimated_tdc = land_cost + hard_costs_with_contingency + predevelopment + soft_costs
+    # Add ~10% for financing costs
+    estimated_tdc *= 1.10
+
+    # Store estimated TDC for reference
+    st.session_state["estimated_tdc"] = estimated_tdc
+
+    # Helper to parse currency input (handles commas)
+    def parse_currency(val: str) -> float:
+        if not val:
+            return 0.0
+        return float(val.replace(",", "").replace("$", "").strip() or 0)
+
+    # Use the SAME session state keys as Property Tax tab for TIF calculation
+    # This ensures manual adjustments on the Property Tax tab flow through correctly
+
+    # Base value: use Property Tax tab's tif_base_value_str if set, else existing_assessed_value
+    if "tif_base_value_str" in st.session_state:
+        base_value = parse_currency(st.session_state["tif_base_value_str"])
+    else:
+        base_value = st.session_state.get("existing_assessed_value", 5_000_000)
+
+    # New value: use Property Tax tab's tif_new_value_str if set, else estimated TDC
+    if "tif_new_value_str" in st.session_state:
+        new_value = parse_currency(st.session_state["tif_new_value_str"])
+    else:
+        new_value = estimated_tdc
+
+    # Cap rate: use Property Tax tab's prop_tif_cap_rate if set, else default
+    if "prop_tif_cap_rate" in st.session_state:
+        tif_cap_rate = st.session_state["prop_tif_cap_rate"] / 100  # Slider stores as percentage
+    else:
+        tif_cap_rate = 0.095  # Default
+
+    # Calculate TIF lump sum using consistent inputs
+    tax_stack = get_austin_tax_stack()
+    increment = max(0, new_value - base_value)
+    annual_city_increment = increment * tax_stack.tif_participating_rate_decimal
+
+    if tif_cap_rate > 0:
+        tif_lump_sum = annual_city_increment / tif_cap_rate
+        st.session_state["calculated_tif_lump_sum"] = tif_lump_sum
+
+
 def main():
     """Main application entry point."""
     st.title("🏠 Austin Affordable Housing Incentive Calculator")
     st.caption("Model multifamily developments and analyze incentive impacts on returns")
 
-    # Render sidebar
-    render_sidebar()
-
-    # Main content tabs
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    # Main content tabs - render FIRST so inputs update session state
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "⚙️ Project Inputs",
         "🏢 Unit Mix",
         "🏛️ Property Tax",
@@ -3374,35 +3706,66 @@ def main():
         "🎁 Incentives",
         "💰 Detailed Cash Flows",
         "📊 Results",
-        "🎲 Monte Carlo"
+        "🎲 Monte Carlo",
+        "🔍 Spreadsheet Debug"
     ])
 
     # Get inputs from session state
     inputs = get_session_state_inputs()
 
+    # Pre-calculate derived values (TIF, etc.) so they're available to all tabs
+    _precalculate_derived_values(inputs)
+
     # Get scenario configuration
     model_config = get_model_config_from_session()
 
-    # Run analysis based on mode
-    try:
-        if model_config.mode == ModelMode.COMPARISON:
-            # Use scenario-specific configurations
-            market_result, mixed_result, market_metrics, mixed_metrics, comparison = run_analysis(
-                inputs,
-                scenario_a=model_config.scenario_a,
-                scenario_b=model_config.scenario_b,
-            )
-        else:
-            # Single project mode - run both but use the single scenario config
-            market_result, mixed_result, market_metrics, mixed_metrics, comparison = run_analysis(
-                inputs,
-                scenario_a=model_config.single_scenario if model_config.single_project_type == ProjectType.MARKET_RATE else None,
-                scenario_b=model_config.single_scenario if model_config.single_project_type == ProjectType.MIXED_INCOME else None,
-            )
+    # Use cached results from sidebar (single source of truth)
+    # The sidebar calls run_analysis() and caches results in session state
+    market_result = st.session_state.get("_cached_market_result")
+    mixed_result = st.session_state.get("_cached_mixed_result")
+    market_metrics = st.session_state.get("_cached_market_metrics")
+    mixed_metrics = st.session_state.get("_cached_mixed_metrics")
+
+    if market_result and mixed_result and market_metrics and mixed_metrics:
+        # Build comparison from cached results
+        from src.calculations.metrics import ScenarioComparison
+        irr_diff_bps = int((mixed_metrics.levered_irr - market_metrics.levered_irr) * 10000)
+        comparison = ScenarioComparison(
+            market=market_metrics,
+            mixed_income=mixed_metrics,
+            irr_difference_bps=irr_diff_bps,
+            noi_gap_annual=market_metrics.noi_annual - mixed_metrics.noi_annual,
+            equity_difference=market_metrics.equity_required - mixed_metrics.equity_required,
+            tdc_difference=market_metrics.tdc - mixed_metrics.tdc,
+            total_incentive_value=st.session_state.get("calculated_tif_lump_sum", 0.0),
+            incentive_irr_impact_bps=irr_diff_bps,
+            meets_target=irr_diff_bps >= 150,
+        )
         analysis_success = True
-    except Exception as e:
-        st.error(f"Error running analysis: {e}")
-        analysis_success = False
+    else:
+        # Fallback: run analysis if cache is not available
+        try:
+            if model_config.mode == ModelMode.COMPARISON:
+                market_result, mixed_result, market_metrics, mixed_metrics, comparison = run_analysis(
+                    inputs,
+                    scenario_a=model_config.scenario_a,
+                    scenario_b=model_config.scenario_b,
+                )
+            else:
+                market_result, mixed_result, market_metrics, mixed_metrics, comparison = run_analysis(
+                    inputs,
+                    scenario_a=model_config.single_scenario if model_config.single_project_type == ProjectType.MARKET_RATE else None,
+                    scenario_b=model_config.single_scenario if model_config.single_project_type == ProjectType.MIXED_INCOME else None,
+                )
+            # Cache results so tabs can use them
+            st.session_state["_cached_market_result"] = market_result
+            st.session_state["_cached_mixed_result"] = mixed_result
+            st.session_state["_cached_market_metrics"] = market_metrics
+            st.session_state["_cached_mixed_metrics"] = mixed_metrics
+            analysis_success = True
+        except Exception as e:
+            st.error(f"Error running analysis: {e}")
+            analysis_success = False
 
     with tab0:
         render_project_inputs_tab()
@@ -3442,6 +3805,18 @@ def main():
 
     with tab7:
         render_monte_carlo_tab(inputs)
+
+    with tab8:
+        # Spreadsheet Debug View - only render when tab is selected
+        # Uses cached results from session state
+        if market_result and mixed_result:
+            render_full_debug_page(market_result, mixed_result)
+        else:
+            st.warning("Run analysis first to see debug view. Results are calculated when inputs change.")
+            st.info("Go to the Results tab or check the sidebar to trigger calculation.")
+
+    # Render sidebar AFTER tabs so input widgets have updated session state
+    render_sidebar()
 
 
 if __name__ == "__main__":

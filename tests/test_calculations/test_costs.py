@@ -20,8 +20,10 @@ class TestCalculateIDC:
 
         # Should converge before max iterations
         assert iterations < 50
-        # IDC should be positive and reasonable (5-15% of costs typically)
-        assert 2_000_000 < idc < 7_000_000
+        # IDC should be positive and reasonable
+        # With S-curve draws (debt builds gradually), IDC is ~4% of costs
+        # For $45M at 65% LTC over 24 months at 7.5%, expect ~$1.5-2.5M
+        assert 1_000_000 < idc < 3_000_000
 
     def test_idc_increases_with_longer_construction(self):
         """Longer construction period should increase IDC."""
@@ -112,11 +114,12 @@ class TestCalculateTDC:
             construction_months=24,
         )
 
+        # TDC = land + hard + soft + financing_costs_total (which includes IDC + loan_fee)
         expected_sum = (
             result.land_cost
             + result.hard_costs
             + result.soft_costs_after_waiver
-            + result.idc
+            + result.financing_costs_total  # IDC + loan_fee
         )
         assert abs(result.tdc - expected_sum) < 1  # Within $1 rounding
 
@@ -164,25 +167,13 @@ class TestCalculateTDC:
 
     def test_spec_inputs_tdc_approximately_correct(self, spec_inputs):
         """TDC with spec inputs should be approximately $50.4M."""
-        from src.calculations.land import calculate_land
+        from src.calculations.detailed_cashflow import calculate_deal
+        from src.models.project import Scenario
 
-        land_result = calculate_land(
-            target_units=spec_inputs.target_units,
-            construction_type=spec_inputs.construction_type,
-            land_cost_per_acre=spec_inputs.land_cost_per_acre,
-        )
-
-        result = calculate_tdc(
-            land_cost=land_result.land_cost,
-            target_units=spec_inputs.target_units,
-            hard_cost_per_unit=spec_inputs.hard_cost_per_unit,
-            soft_cost_pct=spec_inputs.soft_cost_pct,
-            construction_ltc=spec_inputs.construction_ltc,
-            construction_rate=spec_inputs.construction_rate,
-            construction_months=spec_inputs.construction_months,
-        )
+        # Use calculate_deal as SINGLE SOURCE OF TRUTH
+        result = calculate_deal(spec_inputs, Scenario.MARKET)
 
         # Should be within 10% of expected $50.4M
         from tests.fixtures.test_inputs import EXPECTED_MARKET_TDC
         tolerance = EXPECTED_MARKET_TDC * 0.10
-        assert abs(result.tdc - EXPECTED_MARKET_TDC) < tolerance
+        assert abs(result.sources_uses.tdc - EXPECTED_MARKET_TDC) < tolerance

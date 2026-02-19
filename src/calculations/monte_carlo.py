@@ -37,10 +37,14 @@ import multiprocessing
 
 from src.calculations.detailed_cashflow import (
     generate_detailed_cash_flow,
+    calculate_deal,
     DetailedCashFlowResult,
     AssessedValueBasis,
 )
 from src.calculations.property_tax import get_austin_tax_stack, TaxingAuthorityStack
+from src.models.project import ProjectInputs, Scenario
+from src.calculations.units import allocate_units, get_total_units, get_total_affordable_units
+from src.calculations.revenue import calculate_gpr
 
 
 class DistributionType(str, Enum):
@@ -165,6 +169,9 @@ class BaseInputs:
     vacancy_rate: float = 0.06
     leaseup_pace: float = 0.15
     max_occupancy: float = 0.94
+    # Average GSF per unit (default from ProjectInputs default unit mix)
+    # Calculated: 600*0.12 + 750*0.25 + 900*0.45 + 1150*0.15 + 1450*0.03 = 880.5
+    avg_gsf: float = 880.5
 
     # Operating
     annual_opex_per_unit: float = 4_500
@@ -273,19 +280,86 @@ class BaseInputs:
             "tif_start_delay_months": self.tif_start_delay_months,
         }
 
+    def to_project_inputs(self) -> ProjectInputs:
+        """Convert BaseInputs to ProjectInputs for unified calculation engine.
+
+        Note: Some parameters don't have direct mappings:
+        - monthly_gpr_at_stabilization: Derived from unit mix and market_rent_psf
+        - affordable_rent_discount: Replaced by ami_level in ProjectInputs
+
+        This conversion estimates market_rent_psf from monthly_gpr_at_stabilization.
+        """
+        # Estimate market_rent_psf from monthly GPR using avg_gsf
+        estimated_rent_psf = self.monthly_gpr_at_stabilization / (self.total_units * self.avg_gsf)
+
+        # Map affordable_rent_discount to AMI level (approximate)
+        # 65% discount ≈ 30% AMI, 50% discount ≈ 50% AMI, 35% discount ≈ 60% AMI
+        if self.affordable_rent_discount >= 0.60:
+            ami_level = "30%"
+        elif self.affordable_rent_discount >= 0.45:
+            ami_level = "50%"
+        elif self.affordable_rent_discount >= 0.30:
+            ami_level = "60%"
+        else:
+            ami_level = "80%"
+
+        return ProjectInputs(
+            # Timing
+            predevelopment_start=self.start_date,
+            predevelopment_months=self.predevelopment_months,
+            construction_months=self.construction_months,
+            leaseup_months=self.leaseup_months,
+            operations_months=self.operations_months,
+            # Land & Construction
+            land_cost=self.land_cost,
+            target_units=self.total_units,
+            hard_cost_per_unit=self.hard_costs / self.total_units if self.total_units > 0 else 175_000,
+            soft_cost_pct=self.soft_cost_pct,
+            # Rents
+            market_rent_psf=estimated_rent_psf,
+            # Operating
+            vacancy_rate=self.vacancy_rate,
+            leaseup_pace=self.leaseup_pace,
+            max_occupancy=self.max_occupancy,
+            market_rent_growth=self.market_rent_growth,
+            affordable_rent_growth=self.affordable_rent_growth,
+            opex_growth=self.opex_growth,
+            # Financing
+            construction_rate=self.construction_rate,
+            construction_ltc=self.construction_ltc,
+            perm_rate=self.perm_rate,
+            perm_amort_years=self.perm_amort_years,
+            perm_ltv_max=self.perm_ltv_max,
+            perm_dscr_min=self.perm_dscr_min,
+            # Property Tax
+            existing_assessed_value=self.existing_assessed_value,
+            property_tax_growth=self.prop_tax_growth,
+            # Exit
+            exit_cap_rate=self.exit_cap_rate,
+            # Incentives
+            affordable_pct=self.affordable_pct,
+            ami_level=ami_level,
+        )
+
 
 @dataclass
 class MonteCarloConfig:
     """Configuration for Monte Carlo simulation.
 
     Attributes:
-        base_inputs: Default input values for parameters not being varied
+        base_inputs: Default input values for parameters not being varied.
+            Can be BaseInputs (legacy) or ProjectInputs (unified engine).
         distributions: List of distributions for parameters to vary
         n_iterations: Number of simulation iterations
         seed: Random seed for reproducibility
         confidence_level: Confidence level for intervals (default 0.95 = 95%)
         parallel: Whether to run iterations in parallel
         max_workers: Max parallel workers (None = CPU count)
+        use_unified_engine: Use calculate_deal() instead of generate_detailed_cash_flow().
+            Recommended for consistency with main application.
+        scenario: Scenario type when using unified engine (default MARKET)
+        tif_lump_sum: TIF lump sum for unified engine (default 0)
+        tif_treatment: TIF treatment for unified engine (default "none")
     """
     base_inputs: BaseInputs
     distributions: List[InputDistribution]
@@ -294,6 +368,11 @@ class MonteCarloConfig:
     confidence_level: float = 0.95
     parallel: bool = True
     max_workers: Optional[int] = None
+    # Unified engine options
+    use_unified_engine: bool = True  # Default to SINGLE SOURCE OF TRUTH
+    scenario: Scenario = Scenario.MARKET
+    tif_lump_sum: float = 0.0
+    tif_treatment: str = "none"
 
 
 @dataclass
@@ -484,6 +563,125 @@ def _run_single_iteration(
         )
 
 
+def _run_single_iteration_unified(
+    iteration: int,
+    base_project_inputs: ProjectInputs,
+    distributions: List[InputDistribution],
+    seed: int,
+    scenario: Scenario,
+    tif_lump_sum: float = 0.0,
+    tif_treatment: str = "none",
+) -> IterationResult:
+    """Run a single Monte Carlo iteration using the unified calculation engine.
+
+    This version uses calculate_deal() as the single source of truth,
+    ensuring consistency with the main application.
+
+    Args:
+        iteration: Iteration number
+        base_project_inputs: Base ProjectInputs object
+        distributions: List of input distributions
+        seed: Random seed for this iteration
+        scenario: MARKET or MIXED_INCOME scenario
+        tif_lump_sum: TIF lump sum amount (for mixed income)
+        tif_treatment: TIF treatment type
+
+    Returns:
+        IterationResult with sampled inputs and IRRs
+    """
+    import copy
+
+    # Create RNG for this iteration
+    rng = np.random.default_rng(seed)
+
+    # Deep copy the inputs so we can modify them
+    inputs = copy.deepcopy(base_project_inputs)
+
+    # Sample from distributions and override inputs
+    sampled = {}
+
+    # Map distribution parameters to ProjectInputs attributes
+    param_mapping = {
+        # Direct mappings (same name)
+        "target_units": "target_units",
+        "soft_cost_pct": "soft_cost_pct",
+        "vacancy_rate": "vacancy_rate",
+        "leaseup_pace": "leaseup_pace",
+        "max_occupancy": "max_occupancy",
+        "market_rent_growth": "market_rent_growth",
+        "affordable_rent_growth": "affordable_rent_growth",
+        "opex_growth": "opex_growth",
+        "construction_rate": "construction_rate",
+        "construction_ltc": "construction_ltc",
+        "perm_rate": "perm_rate",
+        "perm_amort_years": "perm_amort_years",
+        "perm_ltv_max": "perm_ltv_max",
+        "perm_dscr_min": "perm_dscr_min",
+        "exit_cap_rate": "exit_cap_rate",
+        "affordable_pct": "affordable_pct",
+        "predevelopment_months": "predevelopment_months",
+        "construction_months": "construction_months",
+        "leaseup_months": "leaseup_months",
+        "operations_months": "operations_months",
+        "market_rent_psf": "market_rent_psf",
+        "hard_cost_per_unit": "hard_cost_per_unit",
+    }
+
+    for dist in distributions:
+        value = dist.sample(rng)
+        sampled[dist.parameter] = value
+
+        # Apply the sampled value to inputs
+        if dist.parameter in param_mapping:
+            attr_name = param_mapping[dist.parameter]
+            setattr(inputs, attr_name, value)
+        elif dist.parameter == "hard_costs":
+            # Convert total hard costs to per-unit
+            inputs.hard_cost_per_unit = value / inputs.target_units if inputs.target_units > 0 else value
+        elif dist.parameter == "monthly_gpr_at_stabilization":
+            # Estimate market_rent_psf from monthly GPR
+            avg_gsf = inputs.get_weighted_avg_gsf() or 850
+            inputs.market_rent_psf = value / (inputs.target_units * avg_gsf)
+        elif dist.parameter == "total_units":
+            inputs.target_units = int(value)
+        elif dist.parameter == "land_cost":
+            # Land cost is now a direct input (lump sum)
+            inputs.land_cost = value
+        # Additional parameters can be mapped here as needed
+
+    # Run DCF using unified engine
+    try:
+        result = calculate_deal(
+            inputs=inputs,
+            scenario=scenario,
+            tif_lump_sum=tif_lump_sum,
+            tif_treatment=tif_treatment,
+        )
+
+        return IterationResult(
+            iteration=iteration,
+            inputs=sampled,
+            unlevered_irr=result.unlevered_irr,
+            levered_irr=result.levered_irr,
+            tdc=result.sources_uses.tdc,
+            equity=result.total_equity_invested,
+            noi=result.total_noi,
+            reversion=result.reversion_value,
+        )
+    except Exception as e:
+        # Return NaN for failed iterations
+        return IterationResult(
+            iteration=iteration,
+            inputs=sampled,
+            unlevered_irr=float('nan'),
+            levered_irr=float('nan'),
+            tdc=0,
+            equity=0,
+            noi=0,
+            reversion=0,
+        )
+
+
 def run_monte_carlo(
     config: MonteCarloConfig,
     target_irr: float = 0.10,
@@ -499,10 +697,6 @@ def run_monte_carlo(
     Returns:
         MonteCarloResult with all statistics and iteration data
     """
-    # Initialize
-    base_inputs = config.base_inputs.to_dict()
-    tax_stack = get_austin_tax_stack()
-
     # Create master RNG for reproducibility
     master_rng = np.random.default_rng(config.seed)
 
@@ -512,38 +706,85 @@ def run_monte_carlo(
     # Run iterations
     results: List[IterationResult] = []
 
-    if config.parallel and config.n_iterations > 10:
-        # Parallel execution
-        max_workers = config.max_workers or min(multiprocessing.cpu_count(), 8)
+    if config.use_unified_engine:
+        # Use unified calculation engine (calculate_deal)
+        # Convert BaseInputs to ProjectInputs if needed
+        if isinstance(config.base_inputs, BaseInputs):
+            project_inputs = config.base_inputs.to_project_inputs()
+        else:
+            project_inputs = config.base_inputs
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    _run_single_iteration,
+        if config.parallel and config.n_iterations > 10:
+            max_workers = config.max_workers or min(multiprocessing.cpu_count(), 8)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _run_single_iteration_unified,
+                        i,
+                        project_inputs,
+                        config.distributions,
+                        int(iteration_seeds[i]),
+                        config.scenario,
+                        config.tif_lump_sum,
+                        config.tif_treatment,
+                    )
+                    for i in range(config.n_iterations)
+                ]
+
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    results.append(future.result())
+                    if progress_callback:
+                        progress_callback(i + 1, config.n_iterations)
+        else:
+            for i in range(config.n_iterations):
+                result = _run_single_iteration_unified(
+                    i,
+                    project_inputs,
+                    config.distributions,
+                    int(iteration_seeds[i]),
+                    config.scenario,
+                    config.tif_lump_sum,
+                    config.tif_treatment,
+                )
+                results.append(result)
+                if progress_callback:
+                    progress_callback(i + 1, config.n_iterations)
+    else:
+        # Legacy mode: use generate_detailed_cash_flow directly
+        base_inputs = config.base_inputs.to_dict()
+        tax_stack = get_austin_tax_stack()
+
+        if config.parallel and config.n_iterations > 10:
+            max_workers = config.max_workers or min(multiprocessing.cpu_count(), 8)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _run_single_iteration,
+                        i,
+                        base_inputs,
+                        config.distributions,
+                        int(iteration_seeds[i]),
+                        tax_stack,
+                    )
+                    for i in range(config.n_iterations)
+                ]
+
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    results.append(future.result())
+                    if progress_callback:
+                        progress_callback(i + 1, config.n_iterations)
+        else:
+            for i in range(config.n_iterations):
+                result = _run_single_iteration(
                     i,
                     base_inputs,
                     config.distributions,
                     int(iteration_seeds[i]),
                     tax_stack,
                 )
-                for i in range(config.n_iterations)
-            ]
-
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                results.append(future.result())
-                if progress_callback:
-                    progress_callback(i + 1, config.n_iterations)
-    else:
-        # Sequential execution
-        for i in range(config.n_iterations):
-            result = _run_single_iteration(
-                i,
-                base_inputs,
-                config.distributions,
-                int(iteration_seeds[i]),
-                tax_stack,
-            )
-            results.append(result)
+                results.append(result)
             if progress_callback:
                 progress_callback(i + 1, config.n_iterations)
 
@@ -988,6 +1229,7 @@ def run_tif_grid_search(
     seed: Optional[int] = None,
     confidence_level: float = 0.95,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    use_unified_engine: bool = True,  # Default to SINGLE SOURCE OF TRUTH
 ) -> TIFGridSearchResult:
     """Run grid search over TIF cap rates and terms.
 
@@ -1009,15 +1251,25 @@ def run_tif_grid_search(
         seed: Random seed for reproducibility
         confidence_level: Confidence level for intervals
         progress_callback: Optional callback(completed, total)
+        use_unified_engine: Use calculate_deal() instead of generate_detailed_cash_flow()
 
     Returns:
         TIFGridSearchResult with all tested configurations
     """
+    import copy
     total_points = len(cap_rates) * len(terms)
     grid_points: List[TIFGridPoint] = []
 
-    # Get tax stack for TIF calculations
+    # Get tax stack for TIF calculations (legacy mode)
     tax_stack = get_austin_tax_stack()
+
+    # Convert to ProjectInputs if using unified engine
+    project_inputs = None
+    if use_unified_engine:
+        if isinstance(base_inputs, BaseInputs):
+            project_inputs = base_inputs.to_project_inputs()
+        else:
+            project_inputs = base_inputs
 
     # Master RNG
     master_rng = np.random.default_rng(seed)
@@ -1063,28 +1315,76 @@ def run_tif_grid_search(
                     sampled[dist.parameter] = dist.sample(iter_rng)
 
                 # Apply samples to both scenarios
-                market_inputs = market_inputs_dict.copy()
-                mixed_inputs = mixed_inputs_dict.copy()
-                for param, value in sampled.items():
-                    market_inputs[param] = value
-                    mixed_inputs[param] = value
+                if use_unified_engine:
+                    # Use unified calculation engine
+                    market_project = copy.deepcopy(project_inputs)
+                    mixed_project = copy.deepcopy(project_inputs)
 
-                # Run DCFs
-                try:
-                    market_result = generate_detailed_cash_flow(
-                        tax_stack=tax_stack,
-                        **market_inputs
-                    )
-                    mixed_result = generate_detailed_cash_flow(
-                        tax_stack=tax_stack,
-                        **mixed_inputs
-                    )
+                    # Apply sampled values using param mapping
+                    param_mapping = {
+                        "target_units": "target_units",
+                        "soft_cost_pct": "soft_cost_pct",
+                        "vacancy_rate": "vacancy_rate",
+                        "exit_cap_rate": "exit_cap_rate",
+                        "construction_rate": "construction_rate",
+                        "perm_rate": "perm_rate",
+                        "market_rent_psf": "market_rent_psf",
+                        "hard_cost_per_unit": "hard_cost_per_unit",
+                    }
+                    for param, value in sampled.items():
+                        if param in param_mapping:
+                            setattr(market_project, param_mapping[param], value)
+                            setattr(mixed_project, param_mapping[param], value)
+                        elif param == "hard_costs":
+                            per_unit = value / market_project.target_units if market_project.target_units > 0 else value
+                            market_project.hard_cost_per_unit = per_unit
+                            mixed_project.hard_cost_per_unit = per_unit
+                        elif param == "monthly_gpr_at_stabilization":
+                            avg_gsf = market_project.get_weighted_avg_gsf() or 850
+                            rent_psf = value / (market_project.target_units * avg_gsf)
+                            market_project.market_rent_psf = rent_psf
+                            mixed_project.market_rent_psf = rent_psf
 
-                    market_irrs.append(market_result.levered_irr)
-                    mixed_irrs.append(mixed_result.levered_irr)
-                except Exception:
-                    # Skip failed iterations
-                    pass
+                    try:
+                        market_result = calculate_deal(
+                            inputs=market_project,
+                            scenario=Scenario.MARKET,
+                            tif_lump_sum=0,
+                            tif_treatment="none",
+                        )
+                        mixed_result = calculate_deal(
+                            inputs=mixed_project,
+                            scenario=Scenario.MIXED_INCOME,
+                            tif_lump_sum=tif_lump_sum,
+                            tif_treatment="lump_sum",
+                        )
+
+                        market_irrs.append(market_result.levered_irr)
+                        mixed_irrs.append(mixed_result.levered_irr)
+                    except Exception:
+                        pass
+                else:
+                    # Legacy mode: use generate_detailed_cash_flow
+                    market_inputs = market_inputs_dict.copy()
+                    mixed_inputs = mixed_inputs_dict.copy()
+                    for param, value in sampled.items():
+                        market_inputs[param] = value
+                        mixed_inputs[param] = value
+
+                    try:
+                        market_result = generate_detailed_cash_flow(
+                            tax_stack=tax_stack,
+                            **market_inputs
+                        )
+                        mixed_result = generate_detailed_cash_flow(
+                            tax_stack=tax_stack,
+                            **mixed_inputs
+                        )
+
+                        market_irrs.append(market_result.levered_irr)
+                        mixed_irrs.append(mixed_result.levered_irr)
+                    except Exception:
+                        pass
 
             if len(market_irrs) < 10:
                 # Not enough valid iterations
