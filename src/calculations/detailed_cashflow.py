@@ -43,6 +43,7 @@ from src.calculations.property_tax import (
     calculate_assessed_value_schedule, generate_property_tax_schedule,
     get_austin_tax_stack, build_tax_stack_from_rates, AssessedValueTiming
 )
+from src.calculations.trace import TraceContext, trace
 
 
 class LoanType(str, Enum):
@@ -310,6 +311,9 @@ class DetailedCashFlowResult:
     total_debt_service: float
     reversion_value: float
 
+    # Calculation trace (for transparency/auditing)
+    trace_context: Optional[TraceContext] = None
+
     def get_period(self, period: int) -> DetailedPeriodCashFlow:
         """Get cash flow for a specific period (1-indexed)."""
         if period < 1 or period > len(self.periods):
@@ -576,8 +580,30 @@ def generate_detailed_cash_flow(
     stabilized_monthly_noi = stabilized_egi - stabilized_monthly_opex - stabilized_monthly_mgmt_fee - stabilized_monthly_taxes
     stabilized_annual_noi = stabilized_monthly_noi * 12
 
+    # Trace GPR and NOI calculations
+    trace("gpr.gpr_total", total_gpr_monthly, {
+        "gpr.market_gpr_monthly": market_gpr_monthly,
+        "gpr.affordable_gpr_monthly": affordable_gpr_monthly,
+    })
+    trace("operations.egi", stabilized_egi, {
+        "operations.gpr": total_gpr_monthly,
+        "inputs.vacancy_rate": vacancy_rate,
+    })
+    trace("operations.stabilized_noi", stabilized_annual_noi, {
+        "operations.egi": stabilized_egi * 12,
+        "opex.opex_ex_prop_taxes": stabilized_monthly_opex * 12,
+        "operations.management_fee": stabilized_monthly_mgmt_fee * 12,
+        "opex.property_taxes": stabilized_monthly_taxes * 12,
+    })
+
     # Property value for LTV (always income approach for lenders)
     property_value_for_ltv = stabilized_annual_noi / exit_cap_rate
+
+    # Trace property value
+    trace("investment.stabilized_value", property_value_for_ltv, {
+        "operations.stabilized_noi": stabilized_annual_noi,
+        "inputs.exit_cap_rate": exit_cap_rate,
+    })
 
     # Use canonical size_permanent_loan from debt.py (SINGLE SOURCE OF TRUTH)
     perm_loan_result = size_permanent_loan(
@@ -593,6 +619,14 @@ def generate_detailed_cash_flow(
         max_loan_cap=sources_uses.construction_loan if cap_perm_at_construction else None,
     )
     perm_loan_max = perm_loan_result.loan_amount
+
+    # Trace perm loan
+    trace("perm_loan.amount", perm_loan_max, {
+        "investment.stabilized_value": property_value_for_ltv,
+        "inputs.perm_ltv_max": perm_ltv_max,
+        "operations.stabilized_noi": stabilized_annual_noi,
+        "inputs.perm_dscr_min": perm_dscr_min,
+    }, notes=f"Binding constraint: {perm_loan_result.binding_constraint}")
 
     # Generate period-by-period cash flows
     periods: List[DetailedPeriodCashFlow] = []
@@ -928,6 +962,13 @@ def generate_detailed_cash_flow(
 
             reversion_amount = sale_price_net
             reversion_value = sale_price_net
+
+            # Trace reversion calculation
+            trace("investment.reversion", reversion_amount, {
+                "operations.terminal_noi": terminal_noi,
+                "inputs.exit_cap_rate": exit_cap_rate,
+                "inputs.selling_costs_pct": selling_costs_pct,
+            }, period=period, notes=f"basis={reversion_noi_basis}")
         else:
             reversion_amount = 0
 
@@ -1192,6 +1233,22 @@ def generate_detailed_cash_flow(
     except:
         levered_irr = 0.0
 
+    # Trace key return metrics
+    trace("returns.unlevered_irr", unlevered_irr, {
+        "investment.unlevered_cf": sum(adjusted_unlevered_cfs),
+    })
+    trace("returns.levered_irr", levered_irr, {
+        "investment.levered_cf": sum(adjusted_levered_cfs),
+        "sources_uses.equity": total_equity_invested,
+    })
+    trace("returns.yield_on_cost", total_noi / sources_uses.tdc if sources_uses.tdc > 0 else 0, {
+        "operations.total_noi": total_noi,
+        "sources_uses.tdc": sources_uses.tdc,
+    })
+
+    # Get the current trace context to attach to result
+    current_trace = TraceContext.current()
+
     return DetailedCashFlowResult(
         periods=periods,
         sources_uses=sources_uses,
@@ -1207,6 +1264,7 @@ def generate_detailed_cash_flow(
         total_noi=total_noi,
         total_debt_service=total_debt_service,
         reversion_value=reversion_value,
+        trace_context=current_trace,
     )
 
 
@@ -1325,88 +1383,91 @@ def calculate_deal(
         tax_stack = get_austin_tax_stack()
 
     # Call the detailed cash flow generator with proper GPR values
-    return generate_detailed_cash_flow(
-        # Sources & Uses inputs
-        land_cost=inputs.land_cost,
-        hard_costs=hard_costs,
-        soft_cost_pct=effective_soft_cost_pct,
-        construction_ltc=inputs.construction_ltc,
-        construction_rate=inputs.construction_rate,
+    # Wrap in TraceContext to capture all calculation traces
+    with TraceContext() as ctx:
+        result = generate_detailed_cash_flow(
+            # Sources & Uses inputs
+            land_cost=inputs.land_cost,
+            hard_costs=hard_costs,
+            soft_cost_pct=effective_soft_cost_pct,
+            construction_ltc=inputs.construction_ltc,
+            construction_rate=inputs.construction_rate,
 
-        # Timing
-        start_date=inputs.predevelopment_start,
-        predevelopment_months=inputs.predevelopment_months,
-        construction_months=inputs.construction_months,
-        idc_leaseup_months=inputs.idc_leaseup_months,
-        leaseup_months=inputs.leaseup_months,
-        operations_months=inputs.operations_months,
+            # Timing
+            start_date=inputs.predevelopment_start,
+            predevelopment_months=inputs.predevelopment_months,
+            construction_months=inputs.construction_months,
+            idc_leaseup_months=inputs.idc_leaseup_months,
+            leaseup_months=inputs.leaseup_months,
+            operations_months=inputs.operations_months,
 
-        # Revenue - PROPER GPR from unit allocations
-        market_gpr_monthly=gpr_result.market_gpr_monthly,
-        affordable_gpr_monthly=gpr_result.affordable_gpr_monthly,
-        all_market_gpr_monthly=all_market_gpr.total_gpr_monthly,
-        vacancy_rate=inputs.vacancy_rate,
-        leaseup_pace=inputs.leaseup_pace,
-        max_occupancy=inputs.max_occupancy,
+            # Revenue - PROPER GPR from unit allocations
+            market_gpr_monthly=gpr_result.market_gpr_monthly,
+            affordable_gpr_monthly=gpr_result.affordable_gpr_monthly,
+            all_market_gpr_monthly=all_market_gpr.total_gpr_monthly,
+            vacancy_rate=inputs.vacancy_rate,
+            leaseup_pace=inputs.leaseup_pace,
+            max_occupancy=inputs.max_occupancy,
 
-        # Operating expenses
-        annual_opex_per_unit=annual_opex_per_unit,
-        total_units=inputs.target_units,
+            # Operating expenses
+            annual_opex_per_unit=annual_opex_per_unit,
+            total_units=inputs.target_units,
 
-        # Property tax assessed value (required)
-        existing_assessed_value=inputs.existing_assessed_value,
+            # Property tax assessed value (required)
+            existing_assessed_value=inputs.existing_assessed_value,
 
-        # === Optional parameters with defaults ===
-        # Management fee
-        management_fee_pct=inputs.opex_management_pct,
+            # === Optional parameters with defaults ===
+            # Management fee
+            management_fee_pct=inputs.opex_management_pct,
 
-        # Reserves
-        operating_reserve_months=inputs.operating_reserve_months,
-        leaseup_reserve_months=inputs.leaseup_reserve_months,
+            # Reserves
+            operating_reserve_months=inputs.operating_reserve_months,
+            leaseup_reserve_months=inputs.leaseup_reserve_months,
 
-        # Property tax options
-        tax_stack=tax_stack,
-        assessment_growth_rate=inputs.property_tax_growth,
+            # Property tax options
+            tax_stack=tax_stack,
+            assessment_growth_rate=inputs.property_tax_growth,
 
-        # Escalation
-        market_rent_growth=inputs.market_rent_growth,
-        opex_growth=inputs.opex_growth,
-        prop_tax_growth=inputs.property_tax_growth,
+            # Escalation
+            market_rent_growth=inputs.market_rent_growth,
+            opex_growth=inputs.opex_growth,
+            prop_tax_growth=inputs.property_tax_growth,
 
-        # Permanent loan
-        perm_rate=inputs.perm_rate,
-        perm_amort_years=inputs.perm_amort_years,
-        perm_ltv_max=inputs.perm_ltv_max,
-        perm_dscr_min=inputs.perm_dscr_min,
+            # Permanent loan
+            perm_rate=inputs.perm_rate,
+            perm_amort_years=inputs.perm_amort_years,
+            perm_ltv_max=inputs.perm_ltv_max,
+            perm_dscr_min=inputs.perm_dscr_min,
 
-        # Exit
-        exit_cap_rate=inputs.exit_cap_rate,
-        reserves_pct=inputs.reserves_pct,
-        selling_costs_pct=inputs.selling_costs_pct,
-        reversion_noi_basis=inputs.reversion_noi_basis,
+            # Exit
+            exit_cap_rate=inputs.exit_cap_rate,
+            reserves_pct=inputs.reserves_pct,
+            selling_costs_pct=inputs.selling_costs_pct,
+            reversion_noi_basis=inputs.reversion_noi_basis,
 
-        # Mixed income
-        affordable_pct=affordable_pct,
-        affordable_rent_growth=inputs.affordable_rent_growth,
+            # Mixed income
+            affordable_pct=affordable_pct,
+            affordable_rent_growth=inputs.affordable_rent_growth,
 
-        # TIF treatment
-        tif_treatment=tif_treatment,
-        tif_lump_sum=tif_lump_sum,
-        tif_abatement_pct=tif_abatement_pct,
-        tif_abatement_years=tif_abatement_years,
-        tif_stream_pct=tif_stream_pct,
-        tif_stream_years=tif_stream_years,
-        tif_start_delay_months=tif_start_delay_months,
+            # TIF treatment
+            tif_treatment=tif_treatment,
+            tif_lump_sum=tif_lump_sum,
+            tif_abatement_pct=tif_abatement_pct,
+            tif_abatement_years=tif_abatement_years,
+            tif_stream_pct=tif_stream_pct,
+            tif_stream_years=tif_stream_years,
+            tif_start_delay_months=tif_start_delay_months,
 
-        # Additional capital
-        mezzanine_amount=mezzanine_amount,
-        mezzanine_rate=mezzanine_rate,
-        preferred_amount=preferred_amount,
-        preferred_return=preferred_return,
+            # Additional capital
+            mezzanine_amount=mezzanine_amount,
+            mezzanine_rate=mezzanine_rate,
+            preferred_amount=preferred_amount,
+            preferred_return=preferred_return,
 
-        # Detailed breakdown for display
-        hard_cost_contingency=hard_cost_contingency,
-        soft_cost_contingency=soft_cost_contingency,
-        predevelopment_costs=predevelopment_costs,
-        developer_fee=developer_fee,
-    )
+            # Detailed breakdown for display
+            hard_cost_contingency=hard_cost_contingency,
+            soft_cost_contingency=soft_cost_contingency,
+            predevelopment_costs=predevelopment_costs,
+            developer_fee=developer_fee,
+        )
+    return result

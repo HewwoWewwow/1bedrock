@@ -54,6 +54,18 @@ from .tif_calculator import (
     get_tier_tif_defaults,
 )
 
+# Formula Registry and Tracing (for transparent auditing)
+from .formula_registry import (
+    FormulaCategory,
+    FormulaDefinition,
+    FormulaRegistry,
+)
+from .trace import (
+    TracedValue,
+    TraceContext,
+    trace,
+)
+
 # Property tax module with detailed taxing authority breakdown
 from .property_tax import (
     TaxingAuthority,
@@ -146,4 +158,11 @@ __all__ = [
     "TIFCalculationResult",
     "calculate_tif_lump_sum_from_tier",
     "get_tier_tif_defaults",
+    # Formula Registry and Tracing
+    "FormulaCategory",
+    "FormulaDefinition",
+    "FormulaRegistry",
+    "TracedValue",
+    "TraceContext",
+    "trace",
 ]
