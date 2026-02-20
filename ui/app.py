@@ -22,7 +22,7 @@ from src.calculations.metrics import calculate_metrics, calculate_metrics_from_d
 from src.scenarios import run_scenario_matrix, generate_combinations
 from src.calculations.detailed_cashflow import generate_detailed_cash_flow, calculate_deal
 from src.calculations.sources_uses import calculate_sources_uses
-from src.calculations.property_tax import get_austin_tax_stack, analyze_tif
+from src.calculations.property_tax import get_austin_tax_stack
 from ui.components.detailed_cashflow_view import (
     render_sources_uses, render_detailed_cashflow_table,
     render_irr_summary, render_property_tax_engine, render_sensitivity_analysis,

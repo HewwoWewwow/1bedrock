@@ -6,7 +6,6 @@ from typing import Tuple, Optional
 from src.models.scenario_config import (
     ModelMode, ProjectType, TIFTreatment, TIFConfig,
     ScenarioInputs, ModelConfig, SharedInputs,
-    create_default_market_scenario, create_default_mixed_income_scenario,
 )
 from src.models.incentives import IncentiveTier, TIER_REQUIREMENTS
 
