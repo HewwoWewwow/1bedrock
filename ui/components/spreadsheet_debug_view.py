@@ -13,6 +13,8 @@ from src.calculations.detailed_cashflow import (
     DetailedCashFlowResult, DetailedPeriodCashFlow,
 )
 from ui.components.calculation_trace_view import render_calculation_trace_view
+from ui.components.dependency_graph_view import render_dependency_graph_view
+from src.export.audit_report import generate_audit_excel, AuditReportConfig
 
 
 def _format_dollar(value: float) -> str:
@@ -820,6 +822,8 @@ def render_full_debug_page(
         "Market Rate Spreadsheet",
         "Mixed Income Spreadsheet",
         "Calculation Traces",
+        "Dependency Graph",
+        "Audit Export",
         "IRR Debug",
         "Sources & Uses Debug",
     ])
@@ -861,6 +865,77 @@ def render_full_debug_page(
             st.info("Results not available for selected scenario")
 
     with debug_tabs[4]:
+        render_dependency_graph_view()
+
+    with debug_tabs[5]:
+        st.subheader("Audit Export")
+        st.markdown(
+            "Generate a comprehensive Excel report documenting all calculations, "
+            "formulas, and traced values for audit and review purposes."
+        )
+
+        export_scenario = st.radio(
+            "Select Scenario",
+            ["Market Rate", "Mixed Income"],
+            horizontal=True,
+            key="audit_export_scenario"
+        )
+
+        result_to_export = market_result if export_scenario == "Market Rate" else mixed_result
+
+        if result_to_export:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                project_name = st.text_input(
+                    "Project Name",
+                    value="Real Estate Development",
+                    key="audit_project_name"
+                )
+
+            with col2:
+                scenario_label = st.text_input(
+                    "Scenario Label",
+                    value=export_scenario,
+                    key="audit_scenario_label"
+                )
+
+            st.markdown("**Include in Report:**")
+            col1, col2 = st.columns(2)
+            with col1:
+                include_summary = st.checkbox("Summary", value=True, key="audit_inc_summary")
+                include_sources_uses = st.checkbox("Sources & Uses", value=True, key="audit_inc_su")
+                include_formulas = st.checkbox("Formula Registry", value=True, key="audit_inc_formulas")
+            with col2:
+                include_traces = st.checkbox("Traced Calculations", value=True, key="audit_inc_traces")
+                include_cashflows = st.checkbox("Cash Flows", value=True, key="audit_inc_cf")
+
+            if st.button("Generate Audit Report", type="primary", key="generate_audit"):
+                config = AuditReportConfig(
+                    project_name=project_name,
+                    scenario_name=scenario_label,
+                    include_summary=include_summary,
+                    include_sources_uses=include_sources_uses,
+                    include_formula_registry=include_formulas,
+                    include_traced_values=include_traces,
+                    include_cash_flows=include_cashflows,
+                )
+
+                excel_bytes = generate_audit_excel(result_to_export, config)
+
+                st.download_button(
+                    label="Download Excel Report",
+                    data=excel_bytes,
+                    file_name=f"audit_report_{scenario_label.lower().replace(' ', '_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_audit_excel"
+                )
+
+                st.success("Audit report generated successfully!")
+        else:
+            st.info("No results available for selected scenario")
+
+    with debug_tabs[6]:
         st.subheader("IRR Calculation Verification")
 
         irr_scenario = st.radio(
@@ -877,7 +952,7 @@ def render_full_debug_page(
         else:
             st.info("Results not available for selected scenario")
 
-    with debug_tabs[5]:
+    with debug_tabs[7]:
         st.subheader("Sources & Uses Verification")
 
         su_scenario = st.radio(
